@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Ophel Atlas：ChatGPT、Gemini、Claude 大綱導航與對話整理",
+    "description": "擴充功能名稱"
+  },
+  "extensionDescription": {
+    "message": "自動生成即時大綱與時間線，一鍵跳轉長對話任意位置。提供資料夾、對話匯出與提示詞庫，讓 AI 對話的查找與整理更高效，支援主流 AI 平台。",
+    "description": "擴充功能描述"
+  }
+}

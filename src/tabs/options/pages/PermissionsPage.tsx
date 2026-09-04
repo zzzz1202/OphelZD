@@ -1,0 +1,369 @@
+/**
+ * 权限管理页面
+ * 显示和管理扩展的权限
+ */
+import React, { useCallback, useEffect, useState } from "react"
+
+import {
+  CloudIcon,
+  CookieIcon,
+  NotificationIcon,
+  PermissionsIcon,
+  SaveIcon,
+} from "~components/icons"
+import { ConfirmDialog } from "~components/ui"
+import { useSettingsStore } from "~stores/settings-store"
+import { t } from "~utils/i18n"
+import {
+  MSG_CHECK_PERMISSIONS,
+  MSG_REQUEST_PERMISSIONS,
+  MSG_REVOKE_PERMISSIONS,
+  sendToBackground,
+} from "~utils/messaging"
+import { showToast } from "~utils/toast"
+
+import { PageTitle, SettingCard, SettingRow } from "../components"
+
+// 必需权限（在 manifest 中声明，无法动态修改）
+const REQUIRED_PERMISSIONS = [
+  {
+    id: "storage",
+    name: "存储",
+    nameKey: "permissionStorage",
+    description: "permissionStorageDesc",
+    Icon: SaveIcon,
+  },
+]
+
+// 可选权限（非主机权限）
+const OPTIONAL_PERMISSIONS = [
+  {
+    id: "notifications",
+    name: "通知",
+    nameKey: "permissionNotifications",
+    description: "permissionNotificationsDesc",
+    Icon: NotificationIcon,
+    permissions: ["notifications"],
+  },
+  {
+    id: "cookies",
+    name: "Cookie管理",
+    nameKey: "permissionCookies",
+    description: "permissionCookiesDesc",
+    Icon: CookieIcon,
+    permissions: ["cookies"],
+  },
+]
+
+// 可选主机权限
+const OPTIONAL_HOST_PERMISSIONS = [
+  {
+    id: "webdav",
+    name: "WebDAV 访问权限",
+    nameKey: "permissionWebdavAccess",
+    description: "permissionWebdavAccessDesc",
+    Icon: CloudIcon,
+    origins: ["<all_urls>"],
+  },
+]
+
+interface PermissionsPageProps {
+  siteId: string
+}
+
+const PermissionsPage: React.FC<PermissionsPageProps> = () => {
+  const { updateNestedSetting } = useSettingsStore()
+  // 可选权限状态
+  const [optionalPermissionStatus, setOptionalPermissionStatus] = useState<Record<string, boolean>>(
+    {},
+  )
+  const [loading, setLoading] = useState(true)
+
+  // 确认弹窗状态
+  const [confirmDialog, setConfirmDialog] = useState<{
+    open: boolean
+    message: React.ReactNode
+    onConfirm: () => void
+  }>({
+    open: false,
+    message: "",
+    onConfirm: () => {},
+  })
+
+  // 判断是否在扩展页面上下文（可以直接调用权限 API）
+  const isExtensionPage = typeof chrome.permissions !== "undefined"
+
+  // 检查可选权限状态
+  const checkOptionalPermissions = useCallback(async () => {
+    setLoading(true)
+    const status: Record<string, boolean> = {}
+
+    // 检查可选非主机权限
+    for (const perm of OPTIONAL_PERMISSIONS) {
+      try {
+        let result = false
+        if (isExtensionPage) {
+          result = await chrome.permissions.contains({
+            permissions: perm.permissions || [],
+          })
+        } else {
+          const response = await sendToBackground({
+            type: MSG_CHECK_PERMISSIONS,
+            permissions: perm.permissions || [],
+          })
+          if (response && response.success) {
+            result = response.hasPermission
+          }
+        }
+        status[perm.id] = result
+      } catch (e) {
+        console.error(`检查权限 ${perm.id} 失败:`, e)
+        status[perm.id] = false
+      }
+    }
+
+    // 检查可选主机权限
+    for (const perm of OPTIONAL_HOST_PERMISSIONS) {
+      try {
+        let result = false
+        if (isExtensionPage) {
+          result = await chrome.permissions.contains({
+            origins: perm.origins || [],
+          })
+        } else {
+          const response = await sendToBackground({
+            type: MSG_CHECK_PERMISSIONS,
+            origins: perm.origins || [],
+          })
+          if (response && response.success) {
+            result = response.hasPermission
+          }
+        }
+        status[perm.id] = result
+      } catch (e) {
+        console.error(`检查权限 ${perm.id} 失败:`, e)
+        status[perm.id] = false
+      }
+    }
+
+    setOptionalPermissionStatus(status)
+    setLoading(false)
+  }, [isExtensionPage])
+
+  // 请求可选权限（通用函数）
+  const requestPermission = useCallback(
+    async (perm: { id: string; origins?: string[]; permissions?: string[] }) => {
+      try {
+        if (isExtensionPage) {
+          const granted = await chrome.permissions.request({
+            origins: perm.origins?.length ? perm.origins : undefined,
+            permissions: perm.permissions?.length ? perm.permissions : undefined,
+          })
+
+          if (granted) {
+            setOptionalPermissionStatus((prev) => ({ ...prev, [perm.id]: true }))
+          }
+        } else {
+          // Content Script 发送消息请求
+          await sendToBackground({
+            type: MSG_REQUEST_PERMISSIONS,
+            permType: perm.id,
+            origins: perm.origins,
+            permissions: perm.permissions,
+          })
+          // 延迟后自动刷新权限状态（给用户操作弹窗的时间）
+          setTimeout(() => checkOptionalPermissions(), 2000)
+        }
+      } catch (e) {
+        console.error(`请求权限 ${perm.id} 失败:`, e)
+      }
+    },
+    [isExtensionPage, checkOptionalPermissions],
+  )
+
+  // 初始化时检查权限
+  useEffect(() => {
+    checkOptionalPermissions()
+
+    if (isExtensionPage && typeof window !== "undefined") {
+      const urlParams = new URLSearchParams(window.location.search)
+      if (urlParams.get("auto_request") === "true") {
+        setTimeout(() => {
+          const perm = OPTIONAL_HOST_PERMISSIONS[0]
+          if (perm) {
+            requestPermission(perm)
+          }
+        }, 500)
+      }
+    }
+  }, [checkOptionalPermissions, isExtensionPage, requestPermission])
+
+  // 执行撤销逻辑
+  const executeRevoke = async (perm: {
+    id: string
+    origins?: string[]
+    permissions?: string[]
+  }) => {
+    try {
+      let removed = false
+      if (isExtensionPage) {
+        removed = await chrome.permissions.remove({
+          origins: perm.origins?.length ? perm.origins : undefined,
+          permissions: perm.permissions?.length ? perm.permissions : undefined,
+        })
+      } else {
+        const response = await sendToBackground({
+          type: MSG_REVOKE_PERMISSIONS,
+          origins: perm.origins,
+          permissions: perm.permissions,
+        })
+        if (response && response.success) {
+          removed = response.removed
+        }
+      }
+
+      if (removed) {
+        setOptionalPermissionStatus((prev) => ({ ...prev, [perm.id]: false }))
+
+        // 自动关闭相关设置
+        if (perm.id === "notifications") {
+          updateNestedSetting("tab", "showNotification", false)
+        } else if (perm.id === "webdav") {
+          updateNestedSetting("content", "watermarkRemoval", false)
+        }
+      }
+    } catch (e) {
+      console.error(`撤销权限 ${perm.id} 失败:`, e)
+    } finally {
+      setConfirmDialog((prev) => ({ ...prev, open: false }))
+    }
+  }
+
+  // 点击撤销按钮
+  const handleRevokeClick = (perm: { id: string; origins?: string[]; permissions?: string[] }) => {
+    let confirmMsg = t("revokeConfirmDefault")
+
+    if (perm.id === "notifications") {
+      confirmMsg = t("revokeConfirmNotifications")
+    } else if (perm.id === "webdav") {
+      confirmMsg = t("revokeConfirmWebdav")
+    }
+
+    setConfirmDialog({
+      open: true,
+      message: <div style={{ whiteSpace: "pre-wrap" }}>{confirmMsg}</div>,
+      onConfirm: () => executeRevoke(perm),
+    })
+  }
+
+  return (
+    <div>
+      <PageTitle title={t("navPermissions")} Icon={PermissionsIcon} />
+      <p className="settings-page-desc">{t("permissionsPageDesc")}</p>
+
+      {/* 可选权限 */}
+      <SettingCard title={t("optionalPermissions")} description={t("optionalPermissionsDesc")}>
+        {/* 同步提示 + 刷新按钮 */}
+        <div className="settings-perm-header-row">
+          <span style={{ fontSize: "13px", color: "var(--gh-text-secondary, #9ca3af)" }}>
+            {t("permissionsSyncHint")}
+          </span>
+          <button
+            type="button"
+            className="settings-btn settings-btn-secondary"
+            onClick={async (e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              await checkOptionalPermissions()
+              showToast(t("permissionsRefreshed"), 1500)
+            }}
+            disabled={loading}>
+            {loading ? t("refreshing") : t("refreshStatus")}
+          </button>
+        </div>
+
+        {[...OPTIONAL_PERMISSIONS, ...OPTIONAL_HOST_PERMISSIONS].map((perm) => (
+          <SettingRow
+            key={perm.id}
+            label={
+              <span className="settings-perm-item-label">
+                <span className="settings-perm-icon">
+                  <perm.Icon size={16} color="currentColor" />
+                </span>
+                <span>{t(perm.nameKey)}</span>
+              </span>
+            }
+            description={t(perm.description)}
+            settingId={`permission-item-${perm.id}`}>
+            <div className="settings-perm-actions">
+              {optionalPermissionStatus[perm.id] ? (
+                <>
+                  <span className="settings-status-badge is-success">{t("granted")}</span>
+                  <button
+                    type="button"
+                    className="settings-btn settings-btn-secondary"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      handleRevokeClick(perm)
+                    }}>
+                    {t("revoke")}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="settings-status-badge is-danger">{t("notGranted")}</span>
+                  <button
+                    type="button"
+                    className="settings-btn settings-btn-primary"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      requestPermission(perm)
+                    }}>
+                    {t("allowRecommended")}
+                  </button>
+                </>
+              )}
+            </div>
+          </SettingRow>
+        ))}
+      </SettingCard>
+
+      {/* 必需权限（只读展示） */}
+      <SettingCard title={t("requiredPermissions")} description={t("requiredPermissionsDesc")}>
+        {REQUIRED_PERMISSIONS.map((perm) => (
+          <SettingRow
+            key={perm.id}
+            label={
+              <span className="settings-perm-item-label">
+                <span className="settings-perm-icon">
+                  <perm.Icon size={16} color="currentColor" />
+                </span>
+                <span>{t(perm.nameKey)}</span>
+              </span>
+            }
+            description={t(perm.description)}
+            settingId={`permission-item-${perm.id}`}>
+            <span className="settings-status-badge is-muted">{t("required")}</span>
+          </SettingRow>
+        ))}
+      </SettingCard>
+
+      {/* 确认弹窗 */}
+      {confirmDialog.open && (
+        <ConfirmDialog
+          title={t("warning")}
+          message={confirmDialog.message}
+          confirmText={t("confirm")}
+          cancelText={t("cancel")}
+          danger={true}
+          onConfirm={confirmDialog.onConfirm}
+          onCancel={() => setConfirmDialog((prev) => ({ ...prev, open: false }))}
+        />
+      )}
+    </div>
+  )
+}
+
+export default PermissionsPage

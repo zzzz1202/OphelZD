@@ -1,0 +1,177 @@
+import fs from "node:fs"
+import path from "node:path"
+import { format } from "prettier"
+import prettierConfig from "../.prettierrc.mjs"
+
+export const RELEASE_NOTES_OUTPUT_FILE = "src/release-notes/current.ts"
+export const RELEASE_NOTES_MEDIA_FILE = "src/release-notes/media.json"
+export const FULL_CHANGELOG_URLS = {
+  en: "https://ophel.app/docs/changelog",
+  zh: "https://ophel.app/docs/zh/changelog",
+}
+
+const RELEASE_NOTES_MEDIA_TYPES = new Set(["image", "video"])
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function stripTrailing(content) {
+  const lines = content.replace(/\s+$/u, "").split("\n")
+
+  while (lines.length > 0 && lines[0].trim() === "") {
+    lines.shift()
+  }
+
+  while (lines.length > 0 && (lines.at(-1).trim() === "" || lines.at(-1).trim() === "---")) {
+    lines.pop()
+  }
+
+  return lines.join("\n").trim()
+}
+
+export function extractChangelogSection(content, version, fileName) {
+  if (version === "Unreleased") {
+    throw new Error(`${fileName}: [Unreleased] is not a released version`)
+  }
+
+  const headingMatch = content.match(
+    new RegExp(`^## \\[${escapeRegExp(version)}\\](?:\\s+-\\s+([^\\n]+))?\\s*$`, "mu"),
+  )
+
+  if (!headingMatch || headingMatch.index === undefined) {
+    throw new Error(`${fileName}: missing changelog section for ${version}`)
+  }
+
+  const bodyStart = headingMatch.index + headingMatch[0].length
+  const nextHeadingMatch = content.slice(bodyStart).match(/\n## \[[^\]]+\](?:[^\n]*)?\n/u)
+  const bodyEnd =
+    nextHeadingMatch?.index === undefined ? content.length : bodyStart + nextHeadingMatch.index
+  const body = stripTrailing(content.slice(bodyStart, bodyEnd))
+
+  if (!body) {
+    throw new Error(`${fileName}: changelog section for ${version} is empty`)
+  }
+
+  return {
+    date: headingMatch[1]?.trim() || undefined,
+    body,
+  }
+}
+
+function isRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+}
+
+function assertString(value, fieldName) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${fieldName} must be a non-empty string`)
+  }
+
+  return value
+}
+
+function normalizeLocaleRecord(value, fieldName, { partial = false } = {}) {
+  if (!isRecord(value)) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${fieldName} must be an object`)
+  }
+
+  const normalized = {}
+  for (const locale of ["en", "zh"]) {
+    const localeValue = value[locale]
+    if (typeof localeValue === "string" && localeValue.trim()) {
+      normalized[locale] = localeValue
+    } else if (!partial) {
+      throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${fieldName}.${locale} is required`)
+    }
+  }
+
+  if (partial && Object.keys(normalized).length === 0) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${fieldName} must include en or zh`)
+  }
+
+  return normalized
+}
+
+function normalizeReleaseNotesMediaItem(item, version, index) {
+  const itemPath = `${version}[${index}]`
+  if (!isRecord(item)) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${itemPath} must be an object`)
+  }
+
+  const type = item.type ?? "image"
+  if (!RELEASE_NOTES_MEDIA_TYPES.has(type)) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${itemPath}.type must be image or video`)
+  }
+
+  const normalized = {
+    id: assertString(item.id, `${itemPath}.id`),
+    type,
+    src: assertString(item.src, `${itemPath}.src`),
+    alt: normalizeLocaleRecord(item.alt, `${itemPath}.alt`),
+  }
+
+  if (item.poster !== undefined) {
+    if (type !== "video") {
+      throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${itemPath}.poster is only supported for video`)
+    }
+    normalized.poster = assertString(item.poster, `${itemPath}.poster`)
+  }
+
+  if (item.caption !== undefined) {
+    normalized.caption = normalizeLocaleRecord(item.caption, `${itemPath}.caption`, {
+      partial: true,
+    })
+  }
+
+  return normalized
+}
+
+export function readReleaseNotesMediaFromFiles(projectRoot, version) {
+  const filePath = path.join(projectRoot, RELEASE_NOTES_MEDIA_FILE)
+  if (!fs.existsSync(filePath)) return []
+
+  const content = JSON.parse(fs.readFileSync(filePath, "utf8"))
+  if (!isRecord(content)) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: root must be an object keyed by version`)
+  }
+
+  const media = content[version] ?? []
+  if (!Array.isArray(media)) {
+    throw new Error(`${RELEASE_NOTES_MEDIA_FILE}: ${version} must be an array`)
+  }
+
+  return media.map((item, index) => normalizeReleaseNotesMediaItem(item, version, index))
+}
+
+export async function buildReleaseNotesModule({ version, enChangelog, zhChangelog, media = [] }) {
+  const enSection = extractChangelogSection(enChangelog, version, "CHANGELOG.md")
+  const zhSection = extractChangelogSection(zhChangelog, version, "CHANGELOG.zh-CN.md")
+  const releaseDate = enSection.date || zhSection.date
+  const payload = {
+    version,
+    ...(releaseDate ? { date: releaseDate } : {}),
+    notes: {
+      en: enSection.body,
+      zh: zhSection.body,
+    },
+    fullChangelogUrls: FULL_CHANGELOG_URLS,
+    media,
+  }
+
+  const raw = `// Generated by scripts/sync-release-notes.mjs. Do not edit manually.
+import type { ReleaseNotesContent } from "./types"
+
+export const currentReleaseNotes = ${JSON.stringify(payload, null, 2)} as const satisfies ReleaseNotesContent
+`
+  return format(raw, { ...prettierConfig, parser: "typescript" })
+}
+
+export async function buildReleaseNotesModuleFromFiles(projectRoot, version) {
+  return buildReleaseNotesModule({
+    version,
+    enChangelog: fs.readFileSync(path.join(projectRoot, "CHANGELOG.md"), "utf8"),
+    zhChangelog: fs.readFileSync(path.join(projectRoot, "CHANGELOG.zh-CN.md"), "utf8"),
+    media: readReleaseNotesMediaFromFiles(projectRoot, version),
+  })
+}

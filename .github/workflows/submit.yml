@@ -1,0 +1,36 @@
+name: "🏪 Submit to Chrome Web Store"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- 手动触发：重新构建并打包 CWS zip ---
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Build & package for CWS
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          cp -r build/chrome-mv3-prod build/chrome-mv3-cws
+          node scripts/strip-manifest-key.mjs build/chrome-mv3-cws
+          cd build/chrome-mv3-cws && zip -r ../ophel-atlas-cws-upload.zip . && cd ../..
+
+      # --- 提交到 Chrome Web Store ---
+      - name: Submit to Chrome Web Store
+        uses: PlasmoHQ/bpp@v3
+        with:
+          keys: ${{ secrets.SUBMIT_KEYS }}
+          artifact: build/ophel-atlas-cws-upload.zip

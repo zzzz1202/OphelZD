@@ -1,0 +1,41 @@
+/// <reference types="vite/client" />
+/// <reference types="chrome" />
+
+/**
+ * Vite 类型声明
+ *
+ * 用于油猴脚本构建，声明 ?inline 后缀导入的类型
+ */
+
+declare module "*?inline" {
+  const content: string
+  export default content
+}
+
+declare module "*.css?inline" {
+  const content: string
+  export default content
+}
+
+declare const __PLATFORM__: "extension" | "userscript"
+declare const __OPHEL_DEV__: boolean | undefined
+
+declare const GM_info: {
+  scriptHandler?: string
+  scriptMetaStr?: string | null
+  script: {
+    version: string
+    matches?: string[]
+    header?: string | null
+    options?: {
+      override?: {
+        use_matches?: string[]
+        orig_matches?: string[]
+        merge_matches?: boolean
+      }
+    }
+  }
+}
+
+declare function GM_getResourceText(name: string): string
+declare function GM_getResourceURL(name: string): string

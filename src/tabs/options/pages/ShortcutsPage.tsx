@@ -1,0 +1,408 @@
+/**
+ * 快捷键设置页面
+ * 显示和配置所有快捷键
+ */
+import React, { useCallback, useState } from "react"
+
+import { KeyboardIcon } from "~components/icons"
+import { ConfirmDialog, Tooltip } from "~components/ui"
+import {
+  DEFAULT_KEYBINDINGS,
+  formatShortcut,
+  getShortcutParts,
+  isMacOS,
+  normalizeShortcutBinding,
+  normalizeShortcutKey,
+  SHORTCUT_CATEGORIES,
+  SHORTCUT_META,
+  type ShortcutActionId,
+  type ShortcutBinding,
+} from "~constants/shortcuts"
+import { platform } from "~platform"
+import { useSettingsStore } from "~stores/settings-store"
+import { t } from "~utils/i18n"
+import { MSG_OPEN_URL, sendToBackground } from "~utils/messaging"
+
+import { PageTitle, SettingCard, SettingRow, ToggleRow } from "../components"
+
+interface ShortcutsPageProps {
+  siteId: string
+}
+
+// 快捷键录入组件
+const ShortcutInput: React.FC<{
+  binding: ShortcutBinding | null
+  onChange: (binding: ShortcutBinding) => void
+  onRemove: () => void
+  conflictWarning?: string
+}> = ({ binding, onChange, onRemove, conflictWarning }) => {
+  const [isRecording, setIsRecording] = useState(false)
+  const isMac = isMacOS()
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (!isRecording) return
+
+      e.preventDefault()
+      e.stopPropagation()
+
+      // 忽略单独的修饰键
+      if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) {
+        return
+      }
+
+      // Windows 国际键盘上的 AltGr 会被浏览器报告为 Ctrl+Alt，
+      // 录制时需要跳过，避免把输入字符误保存成 Ctrl+Alt 快捷键。
+      if (!isMac && e.getModifierState("AltGraph")) {
+        return
+      }
+
+      const newBinding: ShortcutBinding = {
+        key: normalizeShortcutKey(e.key, e.code),
+        alt: e.altKey,
+        ctrl: isMac ? e.metaKey : e.ctrlKey,
+        shift: e.shiftKey,
+      }
+
+      // 如果没有任何修饰键，取消录入
+      if (!newBinding.alt && !newBinding.ctrl && !newBinding.meta && !newBinding.shift) {
+        // 对于功能键允许单独使用
+        const allowedSingleKeys = [
+          "Escape",
+          "F1",
+          "F2",
+          "F3",
+          "F4",
+          "F5",
+          "F6",
+          "F7",
+          "F8",
+          "F9",
+          "F10",
+          "F11",
+          "F12",
+        ]
+        if (!allowedSingleKeys.includes(e.key)) {
+          return
+        }
+      }
+
+      // 产品约定：mac 不支持真实 Control 作为自定义修饰键，只支持 Command 作为主修饰键
+      if (isMac && e.ctrlKey && !e.metaKey) {
+        return
+      }
+
+      onChange(newBinding)
+      setIsRecording(false)
+    },
+    [isRecording, onChange, isMac],
+  )
+
+  const handleBlur = () => {
+    setIsRecording(false)
+  }
+
+  const parts = binding ? getShortcutParts(binding, isMac) : []
+
+  return (
+    <div className="settings-shortcut-container">
+      <button
+        type="button"
+        className={`settings-shortcut-input ${isRecording ? "is-recording" : ""} ${!binding ? "is-empty" : ""}`}
+        onClick={() => setIsRecording(true)}
+        onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
+        title={
+          isRecording
+            ? t("pressAnyKey")
+            : binding
+              ? formatShortcut(binding, isMac)
+              : t("shortcutNotSet")
+        }>
+        {isRecording ? (
+          <span>{t("pressAnyKey")}</span>
+        ) : parts.length > 0 ? (
+          parts.map((part, index) => (
+            <React.Fragment key={index}>
+              {index > 0 && !isMac && <span className="settings-kbd-separator">+</span>}
+              <kbd className="settings-kbd">{part}</kbd>
+            </React.Fragment>
+          ))
+        ) : (
+          <span>{t("shortcutNotSet")}</span>
+        )}
+      </button>
+      {binding && (
+        <Tooltip content={t("shortcutRemove")}>
+          <button
+            type="button"
+            className="settings-shortcut-remove-btn"
+            onClick={onRemove}
+            aria-label={t("shortcutRemove")}>
+            ✕
+          </button>
+        </Tooltip>
+      )}
+      {conflictWarning && <span className="settings-shortcut-conflict">{conflictWarning}</span>}
+    </div>
+  )
+}
+
+const ShortcutsPage: React.FC<ShortcutsPageProps> = ({ siteId: _siteId }) => {
+  const { settings, setSettings } = useSettingsStore()
+  const shortcuts = settings?.shortcuts
+  const isMac = React.useMemo(() => isMacOS(), [])
+
+  // 检测快捷键冲突
+  const checkConflict = useCallback(
+    (actionId: string, binding: ShortcutBinding | null): string | undefined => {
+      if (!binding) return undefined // null 绑定没有冲突
+      const normalizedBinding = normalizeShortcutBinding(binding)
+      if (!normalizedBinding) return undefined
+      const allBindings = shortcuts?.keybindings || {}
+      for (const [id, b] of Object.entries(allBindings)) {
+        if (id === actionId) continue
+        if (b === null) continue // 跳过已移除的绑定
+        // 跳过不在 SHORTCUT_META 中的旧配置
+        const meta = SHORTCUT_META[id as ShortcutActionId]
+        if (!meta) continue
+
+        const normalizedExistingBinding = normalizeShortcutBinding(b)
+        if (!normalizedExistingBinding) continue
+
+        if (
+          normalizedExistingBinding.key === normalizedBinding.key &&
+          !!normalizedExistingBinding.alt === !!normalizedBinding.alt &&
+          !!normalizedExistingBinding.ctrl === !!normalizedBinding.ctrl &&
+          !!normalizedExistingBinding.shift === !!normalizedBinding.shift
+        ) {
+          const conflictParts = [
+            t("shortcutConflictWith"),
+            `"${t(meta.labelKey)}"`,
+            t("shortcutConflict"),
+          ].filter(Boolean)
+          return conflictParts.join(" ")
+        }
+      }
+      return undefined
+    },
+    [shortcuts?.keybindings],
+  )
+
+  // 更新单个快捷键
+  const updateKeybinding = useCallback(
+    (actionId: string, binding: ShortcutBinding) => {
+      setSettings({
+        shortcuts: {
+          ...shortcuts,
+          enabled: shortcuts?.enabled ?? true,
+          globalUrl: shortcuts?.globalUrl ?? "https://gemini.google.com",
+          keybindings: {
+            ...shortcuts?.keybindings,
+            [actionId]: binding,
+          },
+        },
+      })
+    },
+    [shortcuts, setSettings],
+  )
+
+  // 移除单个快捷键
+  const removeKeybinding = useCallback(
+    (actionId: string) => {
+      setSettings({
+        shortcuts: {
+          ...shortcuts,
+          enabled: shortcuts?.enabled ?? true,
+          globalUrl: shortcuts?.globalUrl ?? "https://gemini.google.com",
+          keybindings: {
+            ...shortcuts?.keybindings,
+            [actionId]: null, // 设置为 null 表示移除
+          },
+        },
+      })
+    },
+    [shortcuts, setSettings],
+  )
+
+  // 恢复默认快捷键确认弹窗状态
+  const [showResetConfirm, setShowResetConfirm] = useState(false)
+
+  // 恢复默认快捷键
+  const resetToDefault = useCallback(() => {
+    setSettings({
+      shortcuts: {
+        ...shortcuts,
+        keybindings: { ...DEFAULT_KEYBINDINGS },
+      },
+    })
+    setShowResetConfirm(false)
+  }, [shortcuts, setSettings])
+
+  // 按分类分组快捷键
+  const groupedActions = Object.entries(SHORTCUT_CATEGORIES).map(([categoryId, categoryMeta]) => {
+    const actions = Object.entries(SHORTCUT_META).filter(
+      ([, meta]) => meta.category === categoryId,
+    ) as [ShortcutActionId, (typeof SHORTCUT_META)[ShortcutActionId]][]
+    return { categoryId, categoryMeta, actions }
+  })
+
+  if (!settings) return null
+
+  return (
+    <div>
+      <PageTitle title={t("navShortcuts")} Icon={KeyboardIcon} />
+      <p className="settings-page-desc">{t("shortcutsPageDesc")}</p>
+
+      <SettingCard title={t("shortcutsGlobalSettings")}>
+        <ToggleRow
+          label={t("enableShortcuts")}
+          description={t("enableShortcutsDesc")}
+          checked={shortcuts?.enabled ?? true}
+          settingId="shortcuts-enabled"
+          onChange={() =>
+            setSettings({
+              shortcuts: {
+                ...shortcuts,
+                enabled: !(shortcuts?.enabled ?? true),
+                globalUrl: shortcuts?.globalUrl ?? "https://gemini.google.com",
+                keybindings: shortcuts?.keybindings ?? DEFAULT_KEYBINDINGS,
+              },
+            })
+          }
+        />
+
+        {platform.hasCapability("commands") && (
+          <>
+            <SettingRow
+              label={t("globalShortcutUrl")}
+              description={(() => {
+                const translated = t("globalShortcutUrlDesc", {
+                  shortcut: isMac ? "⌥O" : "Alt+O",
+                })
+                return translated === "globalShortcutUrlDesc"
+                  ? isMac
+                    ? "按下全局快捷键 ⌥O 时打开的网址"
+                    : "按下全局快捷键 Alt+O 时打开的网址"
+                  : translated
+              })()}
+              settingId="shortcuts-global-url">
+              <input
+                type="text"
+                className="settings-input"
+                value={shortcuts?.globalUrl || "https://gemini.google.com"}
+                onChange={(e) =>
+                  setSettings({
+                    shortcuts: {
+                      ...shortcuts,
+                      enabled: shortcuts?.enabled ?? true,
+                      globalUrl: e.target.value,
+                      keybindings: shortcuts?.keybindings ?? DEFAULT_KEYBINDINGS,
+                    },
+                  })
+                }
+                style={{ width: "280px" }}
+                placeholder="https://gemini.google.com"
+              />
+            </SettingRow>
+
+            <SettingRow
+              label={t("globalShortcutsTitle")}
+              description={t("globalShortcutsDesc")}
+              settingId="shortcuts-browser-shortcuts">
+              {(() => {
+                const ua = navigator.userAgent
+                const isChrome = ua.includes("Chrome") && !ua.includes("Edg/")
+                const isEdge = ua.includes("Edg/")
+                const isFirefox = ua.includes("Firefox")
+
+                const isSupported = isChrome || isEdge || isFirefox
+
+                if (!isSupported) {
+                  return (
+                    <span style={{ fontSize: "13px", color: "var(--gh-text-tertiary)" }}>
+                      {t("browserNotSupported")}
+                    </span>
+                  )
+                }
+
+                let url = "chrome://extensions/shortcuts"
+                if (isEdge) url = "edge://extensions/shortcuts"
+
+                // Firefox does not allow extensions to open about:addons via tabs.create.
+                if (isFirefox) {
+                  return (
+                    <span
+                      style={{
+                        fontSize: "13px",
+                        color: "var(--gh-text-secondary)",
+                        lineHeight: "1.5",
+                      }}>
+                      {t("firefoxShortcutsGuide")}
+                    </span>
+                  )
+                }
+
+                return (
+                  <button
+                    type="button"
+                    className="settings-btn settings-btn-primary"
+                    onClick={() => sendToBackground({ type: MSG_OPEN_URL, url })}>
+                    {t("openBrowserShortcuts")}
+                  </button>
+                )
+              })()}
+            </SettingRow>
+          </>
+        )}
+
+        <div className="settings-shortcuts-footer">
+          <button
+            type="button"
+            className="settings-btn settings-btn-secondary"
+            onClick={() => setShowResetConfirm(true)}>
+            {t("resetShortcuts")}
+          </button>
+        </div>
+      </SettingCard>
+
+      {groupedActions.map(({ categoryId, categoryMeta, actions }) => (
+        <SettingCard key={categoryId} title={t(categoryMeta.labelKey)}>
+          {actions.map(([actionId, meta]) => {
+            const userBinding = shortcuts?.keybindings?.[actionId]
+            const binding =
+              userBinding === null ? null : userBinding || DEFAULT_KEYBINDINGS[actionId]
+            const conflict = checkConflict(actionId, binding)
+
+            return (
+              <SettingRow
+                key={actionId}
+                label={t(meta.labelKey)}
+                disabled={!shortcuts?.enabled}
+                settingId={`shortcut-binding-${actionId}`}>
+                <ShortcutInput
+                  binding={binding}
+                  onChange={(b) => updateKeybinding(actionId, b)}
+                  onRemove={() => removeKeybinding(actionId)}
+                  conflictWarning={conflict || undefined}
+                />
+              </SettingRow>
+            )
+          })}
+        </SettingCard>
+      ))}
+
+      {showResetConfirm && (
+        <ConfirmDialog
+          title={t("resetShortcuts")}
+          message={t("resetShortcutsConfirm")}
+          danger
+          onConfirm={resetToDefault}
+          onCancel={() => setShowResetConfirm(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+export default ShortcutsPage

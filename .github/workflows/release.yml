@@ -1,0 +1,326 @@
+name: "🚀 Build & Release Extension"
+
+on:
+  push:
+    tags:
+      - "v*.*.*" # 匹配 v1.0.0, v1.2.3 等格式的 tag
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 (如 v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写权限来创建 release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # 获取完整历史和所有 tags
+
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+          # 获取上一个版本号（用于 changelog 比较链接）
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG="v1.0.0"
+          fi
+          echo "PREV_VERSION=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate package version
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          RELEASE_VERSION=${{ steps.get_version.outputs.VERSION }}
+          RELEASE_VERSION_NO_V=${RELEASE_VERSION#v}
+
+          if [ "$PACKAGE_VERSION" != "$RELEASE_VERSION_NO_V" ]; then
+            echo "package.json version ($PACKAGE_VERSION) does not match release version ($RELEASE_VERSION_NO_V)"
+            exit 1
+          fi
+
+      - name: Sync supporters sections
+        run: pnpm sync:supporters
+
+      - name: Build all platforms
+        run: pnpm build:all
+
+      - name: Build Userscript
+        run: pnpm build:userscript
+
+      - name: Package all platforms
+        run: pnpm package:all
+
+      - name: Extract Changelog
+        id: extract_changelog
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          VERSION_NO_V=${VERSION#v}
+
+          # Helper: strip trailing blank lines and '---' separators
+          strip_trailing() {
+            awk '{lines[NR]=$0} END{
+              n=NR;
+              while (n>0 && (lines[n]=="" || lines[n]=="---")) n--;
+              for(i=1;i<=n;i++) print lines[i]
+            }'
+          }
+
+          # Extract English changelog section
+          awk -v ver="\\[${VERSION_NO_V}\\]" '
+            /^## \[/ {
+              if (p) exit;
+              if ($0 ~ ver) { p=1; next }
+            }
+            p
+          ' CHANGELOG.md | strip_trailing > RELEASE_NOTE_EN.md
+
+          if [ ! -s RELEASE_NOTE_EN.md ]; then
+            echo "See CHANGELOG.md for details." > RELEASE_NOTE_EN.md
+          fi
+
+          # Compute GitHub anchors from the actual changelog headings.
+          EN_VERSION_ANCHOR=$(node scripts/github-changelog-anchor.mjs CHANGELOG.md "$VERSION_NO_V")
+          ZH_VERSION_ANCHOR=$(node scripts/github-changelog-anchor.mjs CHANGELOG.zh-CN.md "$VERSION_NO_V")
+          EN_CHANGELOG_URL="https://github.com/urzeye/ophel/blob/main/CHANGELOG.md#${EN_VERSION_ANCHOR}"
+          ZH_CHANGELOG_URL="https://github.com/urzeye/ophel/blob/main/CHANGELOG.zh-CN.md#${ZH_VERSION_ANCHOR}"
+
+          # Combine: Chinese link on top, then English content
+          {
+            echo "[🌐 中文版 →](${ZH_CHANGELOG_URL})"
+            echo ""
+            cat RELEASE_NOTE_EN.md
+            echo ""
+            echo "---"
+            echo ""
+          } > RELEASE_NOTE.md
+
+          # Output to GITHUB_OUTPUT (multi-line)
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          cat RELEASE_NOTE.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "en_changelog_url=${EN_CHANGELOG_URL}" >> $GITHUB_OUTPUT
+          echo "zh_changelog_url=${ZH_CHANGELOG_URL}" >> $GITHUB_OUTPUT
+
+      - name: Package for Chrome Web Store
+        run: |
+          # 创建临时目录并复制构建产物
+          cp -r build/chrome-mv3-prod build/chrome-mv3-cws
+
+          # 清理 manifest.json：删除 key 字段，移除引用不存在文件的 web_accessible_resources 条目
+          node scripts/strip-manifest-key.mjs build/chrome-mv3-cws
+
+          # 打包为 zip
+          cd build/chrome-mv3-cws
+          zip -r ../ophel-atlas-cws-upload.zip .
+          cd ../..
+
+      - name: Package for Edge Add-ons Store
+        run: |
+          # 复制 Chrome 构建产物，单独处理 Edge 版本
+          cp -r build/chrome-mv3-prod build/chrome-mv3-edge
+
+          # 替换所有语言的 extensionName 为 Edge 商店合规的短标题（各语言独立翻译）
+          node scripts/patch-edge-locales.mjs build/chrome-mv3-edge
+
+          # 清理 manifest.json：删除 key 字段（Edge Add-ons Store 不允许 key 字段）
+          node scripts/strip-manifest-key.mjs build/chrome-mv3-edge
+
+          # 打包为 zip
+          cd build/chrome-mv3-edge
+          zip -r ../chrome-mv3-edge.zip .
+          cd ../..
+
+      - name: Publish userscript hashed assets
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./build/userscript/userscript-assets
+          publish_branch: userscript-assets
+          destination_dir: userscript-assets
+          keep_files: true
+          user_name: "github-actions[bot]"
+          user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_message: "Publish userscript assets ${{ steps.get_version.outputs.VERSION }} [skip ci]"
+
+      - name: Resolve userscript asset commit
+        id: userscript_assets
+        run: |
+          ASSET_COMMIT=$(git ls-remote origin refs/heads/userscript-assets | awk '{print $1}')
+          if ! echo "$ASSET_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Invalid userscript-assets commit: $ASSET_COMMIT"
+            exit 1
+          fi
+          echo "commit=$ASSET_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Userscript assets commit: $ASSET_COMMIT"
+
+      - name: Pin userscript asset manifest to commit
+        run: |
+          node scripts/pin-userscript-asset-urls.mjs \
+            ${{ steps.userscript_assets.outputs.commit }} \
+            build/userscript/userscript-assets/manifest.json
+
+      - name: Publish pinned userscript manifest
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./build/userscript/userscript-assets
+          publish_branch: userscript-assets
+          destination_dir: userscript-assets
+          keep_files: true
+          user_name: "github-actions[bot]"
+          user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_message: "Pin userscript asset manifest URLs [skip ci]"
+
+      - name: Resolve userscript asset commit (final)
+        id: userscript_assets_final
+        run: |
+          ASSET_COMMIT=$(git ls-remote origin refs/heads/userscript-assets | awk '{print $1}')
+          if ! echo "$ASSET_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Invalid userscript-assets commit: $ASSET_COMMIT"
+            exit 1
+          fi
+          echo "commit=$ASSET_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Userscript assets final commit: $ASSET_COMMIT"
+
+      - name: Pin userscript asset URLs
+        run: |
+          node scripts/pin-userscript-asset-urls.mjs \
+            ${{ steps.userscript_assets_final.outputs.commit }} \
+            build/userscript/ophel.user.js \
+            build/userscript/userscript-assets/manifest.json
+
+      - name: Verify userscript assets on jsDelivr
+        run: |
+          node scripts/verify-userscript-assets.mjs \
+            ${{ steps.userscript_assets_final.outputs.commit }}
+
+      - name: Rename artifacts for release
+        run: |
+          cp build/chrome-mv3-prod.zip build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-chrome.zip
+          cp build/chrome-mv3-edge.zip build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-edge-addons-upload.zip
+          cp build/firefox-mv3-prod.zip build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-firefox.zip
+          cp build/userscript/ophel.user.js build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}.user.js
+          cp build/ophel-atlas-cws-upload.zip build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-cws-upload.zip
+
+      - name: Upload CWS zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cws-upload
+          path: build/ophel-atlas-cws-upload.zip
+          retention-days: 7
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: Ophel Atlas ${{ steps.get_version.outputs.VERSION }}
+          body: |
+            ${{ steps.extract_changelog.outputs.notes }}
+
+            | Platform | File | Note |
+            |----------|------|------|
+            | **Chrome** | `ophel-atlas-${{ steps.get_version.outputs.VERSION }}-chrome.zip` | Manual extension package |
+            | **Firefox** | `ophel-atlas-${{ steps.get_version.outputs.VERSION }}-firefox.zip` | Manual extension package |
+            | **Userscript** | `ophel-atlas-${{ steps.get_version.outputs.VERSION }}.user.js` | Tampermonkey script |
+            | **CWS Upload** | `ophel-atlas-${{ steps.get_version.outputs.VERSION }}-cws-upload.zip` | **For Chrome Web Store submission only** (No Key) |
+            | **Edge Add-ons Upload** | `ophel-atlas-${{ steps.get_version.outputs.VERSION }}-edge-addons-upload.zip` | **For Microsoft Edge Add-ons submission only** (No Key) |
+
+            ### 🏪 Store Version Status | 商店版本状态
+
+            > A GitHub Release only means these release files have been built and published here. It does **not** mean Chrome Web Store, Microsoft Edge Add-ons, or Firefox Add-ons have already been updated.
+            > GitHub Release 只表示这里的发布文件已经构建并发布，并不表示 Chrome Web Store、Microsoft Edge Add-ons 或 Firefox Add-ons 已经同步更新。
+
+            > Official store updates are separate submission, review, approval, and rollout steps. Even after a new version is submitted, each store may publish it at a different time, so store versions can temporarily lag behind this GitHub Release or differ from each other.
+            > 官方商店更新是独立的提交、审核、批准和分发流程。即使新版本已经提交，各商店也可能在不同时间上架，因此商店版本可能暂时落后于本 GitHub Release，或彼此不同步。
+
+            > To confirm whether a store has received this version, check the version shown on that store's public listing. There is no fixed review or rollout time.
+            > 如需确认某个商店是否已更新到此版本，请以该商店公开详情页显示的版本为准；审核和分发时间没有固定时长。
+
+            ### 🔧 Installation | 安装方法
+
+            #### Browser Extensions | 浏览器扩展
+            > **Recommended:** Install Ophel Atlas from the official browser stores: Chrome Web Store, Microsoft Edge Add-ons, or Firefox Add-ons.
+            > **推荐：** 请从官方浏览器商店安装 Ophel Atlas：Chrome Web Store、Microsoft Edge Add-ons 或 Firefox Add-ons。
+
+            > **Do not mix** GitHub release extension packages with store-installed versions. Manual packages and store versions can use different IDs, update channels, and storage areas, which may create duplicate extensions or separate data.
+            > **请不要混用** GitHub Release 中的扩展包与应用商店版本。手动安装包和商店版本可能使用不同的扩展 ID、更新渠道和存储空间，可能导致重复安装或数据不互通。
+
+            > The `*-cws-upload.zip` and `*-edge-addons-upload.zip` files are maintainer submission packages for browser stores. They are not proof that the store version has already been approved or rolled out, and should not be installed manually.
+            > `*-cws-upload.zip` 和 `*-edge-addons-upload.zip` 是维护者提交浏览器商店使用的包，不代表商店版本已经审核通过或完成分发，也不应手动安装。
+
+            > If you already installed a store version, do not install these GitHub extension zips unless you are intentionally testing a separate development copy.
+            > 如果你已经安装了商店版本，请不要再安装这些 GitHub 扩展 zip，除非你明确想测试一个独立的开发副本。
+
+            #### Userscript (Tampermonkey) | 油猴脚本
+            1. Install [Tampermonkey](https://www.tampermonkey.net/) | 安装 Tampermonkey 插件
+            2. Click the `.user.js` file link | 点击 `.user.js` 文件链接即可安装
+
+            ---
+
+            [Full Changelog](https://github.com/urzeye/ophel/compare/${{ steps.get_version.outputs.PREV_VERSION }}...${{ steps.get_version.outputs.VERSION }})
+
+            *Changelog: [CHANGELOG.md](${{ steps.extract_changelog.outputs.en_changelog_url }}) · [中文版 CHANGELOG.zh-CN.md](${{ steps.extract_changelog.outputs.zh_changelog_url }})*
+          files: |
+            build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-chrome.zip
+            build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-edge-addons-upload.zip
+            build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-firefox.zip
+            build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}.user.js
+            build/ophel-atlas-${{ steps.get_version.outputs.VERSION }}-cws-upload.zip
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy README for Userscript
+        run: |
+          cp README*.md build/userscript/
+          cp LICENSE build/userscript/
+          mkdir -p build/userscript/assets
+          mkdir -p build/userscript/docs
+          cp assets/icon.png build/userscript/assets/
+          cp -R docs/readmes build/userscript/docs/
+          mkdir -p build/userscript/docs/media
+          cp -R docs/media/demo build/userscript/docs/media/
+          cp -R docs/media/support build/userscript/docs/media/
+          # 将 demo 图替换为网络链接，避免 release 分支 README 在外部平台渲染异常
+          sed -i 's|!\[Ophel Demo\](./docs/media/demo/outline.gif)|<img src="https://github.com/user-attachments/assets/7161a37b-5fb3-4799-a6a9-25521e1a514f" alt="Ophel Demo" style="max-width:100%;">|g' build/userscript/README*.md
+          sed -i 's|!\[Ophel Demo\](../media/demo/outline.gif)|<img src="https://github.com/user-attachments/assets/7161a37b-5fb3-4799-a6a9-25521e1a514f" alt="Ophel Demo" style="max-width:100%;">|g' build/userscript/docs/readmes/README*.md 2>/dev/null || true
+          # 剥离 shields.io 徽章中的 base64 内联 logo，避免 Greasy Fork 附加信息超过 50000 字符限制
+          sed -i 's/\&logo=data%3Aimage[^"]*//g' build/userscript/README*.md
+          sed -i 's/\&logo=data%3Aimage[^"]*//g' build/userscript/docs/readmes/README*.md 2>/dev/null || true
+
+      - name: Deploy Userscript to release branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./build/userscript
+          publish_branch: release
+          user_name: "github-actions[bot]"
+          user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_message: "Deploy userscript ${{ steps.get_version.outputs.VERSION }} [skip ci]"
+          force_orphan: true

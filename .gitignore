@@ -1,0 +1,66 @@
+
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# misc
+.DS_Store
+*.pem
+*.htm
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# local env files
+.env*.local
+
+out/
+output/
+build/
+dist/
+/registry/dist/
+/.registry-dist/
+
+# plasmo
+.plasmo
+
+# typescript
+.tsbuildinfo
+
+tsconfig.tsbuildinfo
+# VitePress
+docs/site/.vitepress/.temp
+docs/site/.vitepress/cache
+docs/site/.vitepress/dist
+
+.playwright-mcp
+.playwright-cli
+assets/assistant-mermaid-vendor.js
+comparison_result.txt
+test-results/
+
+# Claude AI related (all local, not for sharing)
+.claude/
+
+# Spec workflow
+.spec-workflow/
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db
+.DS_Store
+.codelf/

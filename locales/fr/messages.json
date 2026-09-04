@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Ophel Atlas: Gestionnaire de chats IA pour ChatGPT/Claude/Gemini",
+    "description": "Extension name"
+  },
+  "extensionDescription": {
+    "message": "Créez sommaires et timelines pour naviguer dans vos chats IA en 1 clic. Organisez-les avec dossiers, exports et prompts.",
+    "description": "Extension description"
+  }
+}

@@ -1,0 +1,1682 @@
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react"
+
+import type { SiteAdapter } from "~adapters/base"
+import {
+  createFeatureCapabilitiesFromSignature,
+  getFeatureCapabilitiesSignature,
+  type SitePackCapability,
+} from "~adapters/feature-capabilities"
+import {
+  AnchorIcon,
+  ConversationIcon,
+  DragIcon,
+  FloatingModeIcon,
+  MinimizeIcon,
+  NewTabIcon,
+  OutlineIcon,
+  PromptIcon,
+  // RefreshIcon, (刷新按钮已注释掉)
+  ScrollBottomIcon,
+  ScrollTopIcon,
+  SettingsIcon,
+  SnapToEdgeIcon,
+  ThemeDarkIcon,
+  ThemeLightIcon,
+} from "~components/icons"
+import { SparkleIcon } from "~components/icons/SparkleIcon"
+import { TAB_IDS, isBuiltinSiteId } from "~constants"
+import { isMacOS } from "~constants/shortcuts"
+import type { ConversationManager } from "~core/conversation-manager"
+import type { OutlineManager } from "~core/outline-manager"
+import type { PromptManager } from "~core/prompt-manager"
+import type { ThemeTransitionOrigin } from "~core/theme-manager"
+import { useDraggable } from "~hooks/useDraggable"
+import { useSupportedAiPlatforms } from "~hooks/useSupportedAiPlatforms"
+import { useSettingsStore } from "~stores/settings-store"
+import { attachEditableKeyboardFocusGuard, hasOphelHoverWidthRetainLayer } from "~utils/dom-toolkit"
+import { loadHistoryUntil } from "~utils/history-loader"
+import { t } from "~utils/i18n"
+import { getScrollInfo, smartScrollTo, smartScrollToBottom } from "~utils/scroll-helper"
+import { DEFAULT_SETTINGS, getSiteTheme, type Prompt } from "~utils/storage"
+import { showToast } from "~utils/toast"
+import { OPHEL_FONT_FAMILY_CSS_VAR } from "~utils/font"
+import { anchorStore, withAnchorOp } from "~stores/anchor-store"
+
+import { ConversationsTab } from "./ConversationsTab"
+import { LoadingOverlay } from "./LoadingOverlay"
+import { OutlineTab } from "./OutlineTab"
+import { PromptsTab } from "./PromptsTab"
+import { Tooltip } from "~components/ui/Tooltip"
+
+interface MainPanelProps {
+  onClose: () => void
+  isOpen: boolean
+  isLauncherPeeking?: boolean
+  launcherPeekAnchorRect?: LauncherPeekAnchorRect | null
+  isScrolling?: boolean
+  promptManager: PromptManager
+  conversationManager: ConversationManager
+  outlineManager: OutlineManager
+  adapter?: SiteAdapter | null
+  onThemeToggle?: (event?: ThemeTransitionOrigin) => void
+  themeMode?: "light" | "dark"
+  selectedPromptId?: string | null
+  onPromptSelect?: (prompt: Prompt | null) => void
+  edgeSnapState?: "left" | "right" | null
+  isEdgePeeking?: boolean
+  onEdgeSnap?: (side: "left" | "right") => void
+  onUnsnap?: () => void
+  onInteractionStateChange?: (isActive: boolean) => void
+  onOpenSettings?: () => void
+  isHoverWidthSettingsPreviewActive?: boolean
+  hoverWidthReleaseToken?: number
+  hasUnseenReleaseNotes?: boolean
+  onOpenReleaseNotes?: () => void
+  releaseNotesTitleText?: string
+  releaseNotesPreview?: string
+  onMouseEnter?: React.MouseEventHandler<HTMLDivElement>
+  onMouseLeave?: React.MouseEventHandler<HTMLDivElement>
+}
+
+interface LauncherPeekAnchorRect {
+  left: number
+  right: number
+  top: number
+  bottom: number
+  width: number
+  height: number
+}
+
+const reorderVisiblePanelTabs = (
+  currentOrder: string[],
+  visibleTabs: string[],
+  sourceTab: string,
+  targetTab: string,
+) => {
+  const sourceIndex = visibleTabs.indexOf(sourceTab)
+  const targetIndex = visibleTabs.indexOf(targetTab)
+
+  if (sourceTab === targetTab || sourceIndex === -1 || targetIndex === -1) {
+    return currentOrder
+  }
+
+  const nextVisibleTabs = visibleTabs.filter((tab) => tab !== sourceTab)
+  const nextTargetIndex = nextVisibleTabs.indexOf(targetTab)
+  const insertAfterTarget = sourceIndex < targetIndex
+  const insertIndex = nextTargetIndex + (insertAfterTarget ? 1 : 0)
+  nextVisibleTabs.splice(insertIndex, 0, sourceTab)
+
+  const visibleSet = new Set(visibleTabs)
+  let visibleIndex = 0
+
+  const nextOrder = currentOrder.map((tab) => {
+    if (!visibleSet.has(tab)) {
+      return tab
+    }
+
+    const nextTab = nextVisibleTabs[visibleIndex]
+    visibleIndex += 1
+    return nextTab ?? tab
+  })
+
+  return nextOrder.every((tab, index) => tab === currentOrder[index]) ? currentOrder : nextOrder
+}
+
+const PANEL_MIN_WIDTH = 240
+const PANEL_MAX_WIDTH = 600
+const PANEL_DEFAULT_WIDTH = 320
+const PANEL_DEFAULT_HOVER_WIDTH = 520
+const HOVER_WIDTH_POINTER_QUERY = "(hover: hover) and (pointer: fine)"
+const HOVER_WIDTH_RELEASE_DELAY_MS = 160
+
+const PANEL_TAB_CAPABILITIES: Partial<Record<string, SitePackCapability>> = {
+  [TAB_IDS.PROMPTS]: "prompt-insert",
+  [TAB_IDS.CONVERSATIONS]: "conversation-list",
+  [TAB_IDS.OUTLINE]: "outline",
+}
+
+const clampPanelWidth = (value: number) =>
+  Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, Math.round(value)))
+
+export const MainPanel: React.FC<MainPanelProps> = ({
+  onClose,
+  isOpen,
+  isLauncherPeeking = false,
+  launcherPeekAnchorRect = null,
+  isScrolling,
+  promptManager,
+  conversationManager,
+  outlineManager,
+  adapter,
+  onThemeToggle,
+  themeMode,
+  selectedPromptId,
+  onPromptSelect,
+  edgeSnapState,
+  isEdgePeeking = false,
+  onEdgeSnap,
+  onUnsnap,
+  onInteractionStateChange,
+  onOpenSettings,
+  isHoverWidthSettingsPreviewActive = false,
+  hoverWidthReleaseToken = 0,
+  hasUnseenReleaseNotes = false,
+  onOpenReleaseNotes,
+  releaseNotesTitleText,
+  releaseNotesPreview,
+  onMouseEnter,
+  onMouseLeave,
+}) => {
+  const getButtonCenter = useCallback((button: HTMLButtonElement): ThemeTransitionOrigin => {
+    const rect = button.getBoundingClientRect()
+    return {
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    }
+  }, [])
+
+  const { settings, updateNestedSetting } = useSettingsStore()
+  const currentSettings = settings || DEFAULT_SETTINGS
+  const tabOrder = currentSettings.features?.order || DEFAULT_SETTINGS.features.order
+  const siteId = adapter?.getSiteId() || "_default"
+  const siteInstanceKey = adapter?.getSiteInstanceKey() || "_default"
+  const featureCapabilitiesSignature = getFeatureCapabilitiesSignature(
+    adapter?.getFeatureCapabilities() ?? [],
+  )
+  const featureCapabilities = useMemo(
+    () => createFeatureCapabilitiesFromSignature(featureCapabilitiesSignature),
+    [featureCapabilitiesSignature],
+  )
+  const enforceFeatureCapabilities = Boolean(adapter && !isBuiltinSiteId(siteId))
+  const visibleTabs = useMemo(
+    () =>
+      tabOrder.filter((tabId) => {
+        if (tabId === TAB_IDS.SETTINGS) return false
+        if (tabId === TAB_IDS.PROMPTS && currentSettings.features?.prompts?.enabled === false) {
+          return false
+        }
+        if (
+          tabId === TAB_IDS.CONVERSATIONS &&
+          currentSettings.features?.conversations?.enabled === false
+        ) {
+          return false
+        }
+        if (tabId === TAB_IDS.OUTLINE && currentSettings.features?.outline?.enabled === false) {
+          return false
+        }
+
+        const requiredCapability = PANEL_TAB_CAPABILITIES[tabId]
+        return (
+          !enforceFeatureCapabilities ||
+          !requiredCapability ||
+          featureCapabilities.has(requiredCapability)
+        )
+      }),
+    [currentSettings.features, enforceFeatureCapabilities, featureCapabilities, tabOrder],
+  )
+  const canOpenNewTab = !enforceFeatureCapabilities || featureCapabilities.has("new-chat")
+  const canShowOutlineUserQueries =
+    !enforceFeatureCapabilities || featureCapabilities.has("outline-user-queries")
+  const supportedPlatforms = useSupportedAiPlatforms()
+  const currentPromptPlatform = useMemo(
+    () => supportedPlatforms.find((platform) => platform.id === siteId) ?? null,
+    [siteId, supportedPlatforms],
+  )
+  const defaultPromptPlatformFilter = useMemo(
+    () => (currentPromptPlatform ? [currentPromptPlatform.id] : []),
+    [currentPromptPlatform],
+  )
+  const [promptPlatformFiltersBySite, setPromptPlatformFiltersBySite] = useState<
+    Record<string, string[]>
+  >({})
+  const selectedPromptPlatforms = promptPlatformFiltersBySite[siteId] ?? defaultPromptPlatformFilter
+  const setSelectedPromptPlatforms = useCallback(
+    (next: React.SetStateAction<string[]>) => {
+      setPromptPlatformFiltersBySite((filters) => {
+        const current = filters[siteId] ?? defaultPromptPlatformFilter
+        const resolved = typeof next === "function" ? next(current) : next
+        return { ...filters, [siteId]: resolved }
+      })
+    },
+    [defaultPromptPlatformFilter, siteId],
+  )
+  const siteTheme = getSiteTheme(currentSettings, siteInstanceKey)
+  const resolvedThemeMode = themeMode || (siteTheme.mode === "dark" ? "dark" : "light")
+  const currentThemeStyleId =
+    resolvedThemeMode === "light"
+      ? siteTheme.lightStyleId || "google-gradient"
+      : siteTheme.darkStyleId || "classic-dark"
+  // 浅色模式：所有彩色 header 背景 → currentColor（白色），永远可见
+  // 深色模式：深色纯色 header → 品牌渐变，美观且对比鲜明
+  const panelSparkleColor = resolvedThemeMode === "dark" ? "brand" : "currentColor"
+  const currentCustomStyle = Array.isArray(currentSettings.theme?.customStyles)
+    ? currentSettings.theme.customStyles.find((style) => style.id === currentThemeStyleId)
+    : null
+  const [isPanelHovered, setIsPanelHovered] = useState(false)
+  const [isPanelFocusWithin, setIsPanelFocusWithin] = useState(false)
+  const [isHoverWidthRetained, setIsHoverWidthRetained] = useState(false)
+  const [isHoverWidthModeSwitchSuppressed, setIsHoverWidthModeSwitchSuppressed] = useState(false)
+  const [isHoverWidthResizeSuppressed, setIsHoverWidthResizeSuppressed] = useState(false)
+  const [isPanelResizing, setIsPanelResizing] = useState(false)
+  const [draftPanelWidth, setDraftPanelWidth] = useState<number | null>(null)
+  const hoverWidthReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastPanelPointerDownAtRef = useRef(0)
+  const lastPanelPointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null)
+  const resizeFrameRef = useRef<number | null>(null)
+  const pendingResizeWidthRef = useRef<number | null>(null)
+  const hoverWidthActivityRef = useRef({
+    isFocused: false,
+    isHovered: false,
+    isResizing: false,
+  })
+  const resizeStateRef = useRef<{
+    pointerId: number
+    startX: number
+    startWidth: number
+    handleSide: "left" | "right"
+    hasMoved: boolean
+  } | null>(null)
+
+  // 拖拽功能（高性能版本：直接 DOM 操作，不触发 React 渲染）
+  const { panelRef, headerRef } = useDraggable({
+    edgeSnapHide: !isLauncherPeeking && currentSettings.panel?.panelMode === "edge-snap",
+    edgeSnapState: isLauncherPeeking ? null : edgeSnapState, // 传递当前吸附状态
+    snapThreshold: currentSettings.panel?.edgeSnapThreshold ?? 30,
+    onEdgeSnap,
+    onUnsnap,
+  })
+
+  const getPanelInteractionRoots = useCallback((): Array<Element | ShadowRoot> => {
+    const roots: Array<Element | ShadowRoot> = []
+
+    if (typeof document !== "undefined" && document.body) {
+      roots.push(document.body)
+    }
+
+    const rootNode = panelRef.current?.getRootNode()
+    if (typeof ShadowRoot !== "undefined" && rootNode instanceof ShadowRoot) {
+      roots.push(rootNode)
+    }
+
+    return roots
+  }, [panelRef])
+
+  const hasOpenHoverWidthRetainLayer = useCallback(
+    () => hasOphelHoverWidthRetainLayer(getPanelInteractionRoots()),
+    [getPanelInteractionRoots],
+  )
+
+  const clearHoverWidthReleaseTimer = useCallback(() => {
+    if (hoverWidthReleaseTimerRef.current) {
+      clearTimeout(hoverWidthReleaseTimerRef.current)
+      hoverWidthReleaseTimerRef.current = null
+    }
+  }, [])
+
+  const setPanelHoveredState = useCallback((value: boolean) => {
+    hoverWidthActivityRef.current.isHovered = value
+    setIsPanelHovered(value)
+  }, [])
+
+  const setPanelFocusWithinState = useCallback((value: boolean) => {
+    hoverWidthActivityRef.current.isFocused = value
+    setIsPanelFocusWithin(value)
+  }, [])
+
+  const setPanelResizingState = useCallback((value: boolean) => {
+    hoverWidthActivityRef.current.isResizing = value
+    setIsPanelResizing(value)
+  }, [])
+
+  const prepareEdgeSnapToFloatingSwitch = useCallback(
+    (suppressHoverWidth: boolean = true) => {
+      clearHoverWidthReleaseTimer()
+      setPanelHoveredState(false)
+      setPanelFocusWithinState(false)
+      setIsHoverWidthRetained(false)
+      setIsHoverWidthModeSwitchSuppressed(suppressHoverWidth)
+    },
+    [clearHoverWidthReleaseTimer, setPanelFocusWithinState, setPanelHoveredState],
+  )
+
+  const releaseHoverWidthForExternalLayer = useCallback(() => {
+    clearHoverWidthReleaseTimer()
+    setPanelHoveredState(false)
+    setPanelFocusWithinState(false)
+    setIsHoverWidthRetained(false)
+    setIsHoverWidthModeSwitchSuppressed(false)
+    setIsHoverWidthResizeSuppressed(false)
+  }, [clearHoverWidthReleaseTimer, setPanelFocusWithinState, setPanelHoveredState])
+
+  const updatePanelPointerPosition = useCallback(
+    (event: Pick<MouseEvent, "clientX" | "clientY">) => {
+      lastPanelPointerPositionRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      }
+    },
+    [],
+  )
+
+  const syncPanelHoveredStateFromPointer = useCallback(() => {
+    const panel = panelRef.current
+    const pointer = lastPanelPointerPositionRef.current
+
+    if (!panel || !pointer) {
+      setPanelHoveredState(false)
+      return false
+    }
+
+    const rect = panel.getBoundingClientRect()
+    const isPointerInsidePanel =
+      pointer.clientX >= rect.left &&
+      pointer.clientX <= rect.right &&
+      pointer.clientY >= rect.top &&
+      pointer.clientY <= rect.bottom
+
+    setPanelHoveredState(isPointerInsidePanel)
+    return isPointerInsidePanel
+  }, [panelRef, setPanelHoveredState])
+
+  const releaseHoverWidthIfIdle = useCallback(() => {
+    const activity = hoverWidthActivityRef.current
+    if (activity.isHovered || activity.isFocused || activity.isResizing) {
+      return
+    }
+
+    if (hasOpenHoverWidthRetainLayer()) {
+      setIsHoverWidthRetained(true)
+      return
+    }
+
+    setIsHoverWidthRetained(false)
+  }, [hasOpenHoverWidthRetainLayer])
+
+  const scheduleHoverWidthRelease = useCallback(
+    (delayMs: number = HOVER_WIDTH_RELEASE_DELAY_MS) => {
+      clearHoverWidthReleaseTimer()
+      hoverWidthReleaseTimerRef.current = setTimeout(() => {
+        hoverWidthReleaseTimerRef.current = null
+        releaseHoverWidthIfIdle()
+      }, delayMs)
+    },
+    [clearHoverWidthReleaseTimer, releaseHoverWidthIfIdle],
+  )
+
+  useEffect(() => {
+    return () => {
+      clearHoverWidthReleaseTimer()
+      if (resizeFrameRef.current !== null) {
+        cancelAnimationFrame(resizeFrameRef.current)
+        resizeFrameRef.current = null
+      }
+      if (resizeStateRef.current) {
+        onInteractionStateChange?.(false)
+      }
+    }
+  }, [clearHoverWidthReleaseTimer, onInteractionStateChange])
+
+  useLayoutEffect(() => {
+    if (hoverWidthReleaseToken <= 0) {
+      return
+    }
+
+    releaseHoverWidthForExternalLayer()
+  }, [hoverWidthReleaseToken, releaseHoverWidthForExternalLayer])
+
+  useEffect(() => {
+    const handlePointerPosition = (event: PointerEvent) => {
+      updatePanelPointerPosition(event)
+    }
+
+    window.addEventListener("pointermove", handlePointerPosition, true)
+    window.addEventListener("pointerdown", handlePointerPosition, true)
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerPosition, true)
+      window.removeEventListener("pointerdown", handlePointerPosition, true)
+    }
+  }, [updatePanelPointerPosition])
+
+  useEffect(() => {
+    if (!isHoverWidthRetained || isPanelResizing) {
+      return
+    }
+
+    const roots = getPanelInteractionRoots()
+    let hadRetainLayer = hasOpenHoverWidthRetainLayer()
+    const observer = new MutationObserver(() => {
+      const hasRetainLayer = hasOpenHoverWidthRetainLayer()
+
+      if (hasRetainLayer) {
+        hadRetainLayer = true
+        return
+      }
+
+      if (!hadRetainLayer) {
+        return
+      }
+
+      hadRetainLayer = false
+      syncPanelHoveredStateFromPointer()
+      scheduleHoverWidthRelease()
+    })
+
+    roots.forEach((root) => observer.observe(root, { childList: true, subtree: true }))
+
+    return () => observer.disconnect()
+  }, [
+    getPanelInteractionRoots,
+    hasOpenHoverWidthRetainLayer,
+    isHoverWidthRetained,
+    isPanelResizing,
+    scheduleHoverWidthRelease,
+    syncPanelHoveredStateFromPointer,
+  ])
+
+  // 模式切换时重置面板 DOM 位置
+  // useDraggable 通过直接 DOM 操作设置了 left/top/right/transform，React 无法感知这些变化，
+  // 所以需要在模式切换时手动重置
+  const prevPanelModeRef = useRef(currentSettings.panel?.panelMode)
+  // 保存面板可见位置，用于 edge peek 固定到悬浮时保留垂直位置
+  const savedPeekingRectRef = useRef<DOMRect | null>(null)
+  // (Generic tips have moved to MagicCodex)
+  const pointerEventsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 使用 useLayoutEffect 保证在浏览器绘制前完成定位，避免模式切换时闪烁
+  useLayoutEffect(() => {
+    const currentMode = currentSettings.panel?.panelMode
+    const prevMode = prevPanelModeRef.current
+    prevPanelModeRef.current = currentMode
+
+    if (prevMode === currentMode || !panelRef.current) return
+
+    const panel = panelRef.current
+    panel.classList.remove("dragging")
+
+    if (prevMode === "edge-snap" && currentMode === "floating") {
+      // 恢复 pointer-events：floating→edge-snap 会临时禁用，
+      // 若快速切回 floating，cleanup 已取消恢复定时器，需在此处手动恢复
+      panel.removeAttribute("data-edge-snap-transitioning")
+      panel.style.pointerEvents = ""
+
+      const savedRect = savedPeekingRectRef.current
+      savedPeekingRectRef.current = null
+
+      // 优先使用 header 按钮保存的 peeking 位置，否则用面板当前 rect 判断可见性
+      const fixRect = savedRect ?? panel.getBoundingClientRect()
+      const pointer = lastPanelPointerPositionRef.current
+      const isPointerInsideFixRect = pointer
+        ? pointer.clientX >= fixRect.left &&
+          pointer.clientX <= fixRect.right &&
+          pointer.clientY >= fixRect.top &&
+          pointer.clientY <= fixRect.bottom
+        : false
+      const shouldSuppressHoverWidth =
+        isHoverWidthModeSwitchSuppressed ||
+        hoverWidthActivityRef.current.isHovered ||
+        hoverWidthActivityRef.current.isFocused ||
+        isHoverWidthRetained ||
+        isPointerInsideFixRect
+      prepareEdgeSnapToFloatingSwitch(shouldSuppressHoverWidth)
+
+      // 判断面板是否处于 peeking 展开态（至少 50% 宽度在视口内），排除吸附收缩（胶囊条）
+      const visibleWidth = fixRect
+        ? Math.min(fixRect.right, window.innerWidth) - Math.max(fixRect.left, 0)
+        : 0
+      const isVisible = fixRect.width > 0 && visibleWidth >= fixRect.width * 0.5
+
+      if (isVisible) {
+        // 面板可见（peeking 展开）：按吸附侧贴边固定，避免 hover 宽度回收后留下边缘间距
+        const snappedSide = edgeSnapState ?? currentSettings.panel?.defaultPosition ?? "right"
+        panel.style.top = `${fixRect.top}px`
+        panel.style.transform = "none"
+        if (snappedSide === "left") {
+          panel.style.left = "0px"
+          panel.style.right = "auto"
+        } else {
+          panel.style.right = "0px"
+          panel.style.left = "auto"
+        }
+      } else {
+        // 面板不可见（吸附收缩态）：使用默认边距贴边展开，保留垂直位置（兜底）
+        const pos = currentSettings.panel?.defaultPosition ?? "right"
+        const edgeDist = currentSettings.panel?.defaultEdgeDistance ?? 0
+        const currentTop = fixRect ? fixRect.top : null
+
+        if (currentTop !== null && currentTop >= 0 && currentTop < window.innerHeight) {
+          panel.style.top = `${currentTop}px`
+          panel.style.transform = "none"
+        } else {
+          panel.style.top = "50%"
+          panel.style.transform = "translateY(-50%)"
+        }
+        if (pos === "left") {
+          panel.style.left = `${edgeDist}px`
+          panel.style.right = "auto"
+        } else {
+          panel.style.right = `${edgeDist}px`
+          panel.style.left = "auto"
+        }
+      }
+    } else if (prevMode === "floating" && currentMode === "edge-snap") {
+      // 悬浮 → 吸附：先添加 CSS 吸附类，确保 !important 定位在清除 inline style 前生效
+      const pos = currentSettings.panel?.defaultPosition ?? "right"
+      panel.classList.add(`edge-snapped-${pos}`)
+      panel.setAttribute("data-edge-snap-transitioning", "true")
+      panel.style.top = "50%"
+      panel.style.transform = "translateY(-50%)"
+      panel.style.left = ""
+      panel.style.right = ""
+      // 临时禁用 pointer-events，防止 CSS :hover 在鼠标仍在面板区域时阻止收缩动画
+      panel.style.pointerEvents = "none"
+      if (pointerEventsTimerRef.current) clearTimeout(pointerEventsTimerRef.current)
+      pointerEventsTimerRef.current = setTimeout(() => {
+        panel.removeAttribute("data-edge-snap-transitioning")
+        panel.style.pointerEvents = ""
+        pointerEventsTimerRef.current = null
+      }, 400)
+    }
+
+    return () => {
+      if (pointerEventsTimerRef.current) {
+        clearTimeout(pointerEventsTimerRef.current)
+        pointerEventsTimerRef.current = null
+      }
+      panel.removeAttribute("data-edge-snap-transitioning")
+      panel.style.pointerEvents = ""
+    }
+  }, [
+    currentSettings.panel?.panelMode,
+    currentSettings.panel?.defaultEdgeDistance,
+    currentSettings.panel?.defaultPosition,
+    edgeSnapState,
+    isHoverWidthModeSwitchSuppressed,
+    isHoverWidthRetained,
+    panelRef,
+    prepareEdgeSnapToFloatingSwitch,
+  ])
+
+  const prevEdgeDistanceRef = useRef(currentSettings.panel?.defaultEdgeDistance)
+  const prevPositionRef = useRef(currentSettings.panel?.defaultPosition)
+
+  useLayoutEffect(() => {
+    const currentDist = currentSettings.panel?.defaultEdgeDistance
+    const prevDist = prevEdgeDistanceRef.current
+    prevEdgeDistanceRef.current = currentDist
+
+    const currentPos = currentSettings.panel?.defaultPosition
+    const prevPos = prevPositionRef.current
+    prevPositionRef.current = currentPos
+
+    const isDistChanged = currentDist !== prevDist
+    const isPosChanged = currentPos !== prevPos
+
+    // 只有当默认边距或默认位置发生变化，且处于悬浮模式时，才重置 DOM 样式进行实时预览
+    if (
+      (isDistChanged || isPosChanged) &&
+      panelRef.current &&
+      currentSettings.panel?.panelMode === "floating"
+    ) {
+      const panel = panelRef.current
+      const pos = currentPos ?? "right"
+      const dist = currentDist ?? 0
+
+      if (pos === "left") {
+        panel.style.left = `${dist}px`
+        panel.style.right = "auto"
+      } else {
+        panel.style.right = `${dist}px`
+        panel.style.left = "auto"
+      }
+      panel.style.top = "50%"
+      panel.style.transform = "translateY(-50%)"
+    }
+  }, [
+    currentSettings.panel?.defaultEdgeDistance,
+    currentSettings.panel?.defaultPosition,
+    currentSettings.panel?.panelMode,
+    panelRef,
+  ])
+
+  // 计算默认位置样式
+  const defaultPosition = currentSettings.panel?.defaultPosition ?? "right"
+  const defaultEdgeDistance = currentSettings.panel?.defaultEdgeDistance ?? 40
+  const isEdgeSnapMode = (currentSettings.panel?.panelMode ?? "floating") === "edge-snap"
+  const isEdgeTriggerHidden =
+    (currentSettings.panel?.edgeTriggerMode ?? DEFAULT_SETTINGS.panel.edgeTriggerMode) === "hidden"
+  const supportsHoverResize =
+    typeof window !== "undefined" && window.matchMedia?.(HOVER_WIDTH_POINTER_QUERY).matches
+  const basePanelWidth = clampPanelWidth(
+    draftPanelWidth ?? currentSettings.panel?.width ?? PANEL_DEFAULT_WIDTH,
+  )
+  const hoverPanelWidth = clampPanelWidth(
+    currentSettings.panel?.hoverWidth ?? PANEL_DEFAULT_HOVER_WIDTH,
+  )
+  const canResizeOnHover =
+    (currentSettings.panel?.resizeOnHover ?? false) &&
+    supportsHoverResize &&
+    !isLauncherPeeking &&
+    !isEdgeSnapMode
+  const isHoverWidthActive =
+    canResizeOnHover &&
+    (isHoverWidthSettingsPreviewActive ||
+      (!isHoverWidthModeSwitchSuppressed &&
+        !isHoverWidthResizeSuppressed &&
+        (isPanelHovered || isPanelFocusWithin || isHoverWidthRetained || isPanelResizing)))
+  const panelWidth =
+    isPanelResizing || !isHoverWidthActive
+      ? basePanelWidth
+      : Math.max(basePanelWidth, hoverPanelWidth)
+  const panelHeightVh = currentSettings.panel?.height ?? 85
+  const resizeHandleSide: "left" | "right" =
+    (edgeSnapState ?? defaultPosition) === "left" ? "right" : "left"
+  const previousPanelWidthRef = useRef(panelWidth)
+
+  useLayoutEffect(() => {
+    const previousWidth = previousPanelWidthRef.current
+    previousPanelWidthRef.current = panelWidth
+
+    if (previousWidth === panelWidth || resizeHandleSide !== "left") {
+      return
+    }
+
+    const panel = panelRef.current
+    if (!panel) {
+      return
+    }
+
+    const hasPixelLeftPosition =
+      panel.style.left && panel.style.left !== "auto" && panel.style.transform === "none"
+    if (!hasPixelLeftPosition) {
+      return
+    }
+
+    const rect = panel.getBoundingClientRect()
+    const anchoredRight = rect.left + previousWidth
+    panel.style.left = `${anchoredRight - panelWidth}px`
+    panel.style.right = "auto"
+  }, [panelRef, panelWidth, resizeHandleSide])
+
+  const launcherPeekPositionStyle = useMemo<React.CSSProperties>(() => {
+    if (!isLauncherPeeking || !launcherPeekAnchorRect || typeof window === "undefined") {
+      return {}
+    }
+
+    const viewportWidth = window.innerWidth
+    const viewportHeight = window.innerHeight
+    const viewportMargin = 10
+    const estimatedPanelHeight = Math.max(500, (viewportHeight * panelHeightVh) / 100)
+    const anchorCenterX = launcherPeekAnchorRect.left + launcherPeekAnchorRect.width / 2
+    const anchorCenterY = launcherPeekAnchorRect.top + launcherPeekAnchorRect.height / 2
+    const shouldOpenLeft = anchorCenterX > viewportWidth / 2
+
+    const rawLeft = shouldOpenLeft
+      ? launcherPeekAnchorRect.left - panelWidth
+      : launcherPeekAnchorRect.right
+    const maxLeft = Math.max(viewportMargin, viewportWidth - panelWidth - viewportMargin)
+    const left = Math.min(Math.max(rawLeft, viewportMargin), maxLeft)
+
+    const rawTop = anchorCenterY - estimatedPanelHeight / 2
+    const maxTop = Math.max(viewportMargin, viewportHeight - estimatedPanelHeight - viewportMargin)
+    const top = Math.min(Math.max(rawTop, viewportMargin), maxTop)
+
+    return {
+      left: `${left}px`,
+      right: "auto",
+      top: `${top}px`,
+      transform: "none",
+    }
+  }, [isLauncherPeeking, launcherPeekAnchorRect, panelHeightVh, panelWidth])
+
+  const panelPositionStyle = isLauncherPeeking
+    ? launcherPeekPositionStyle
+    : !isEdgeSnapMode
+      ? defaultPosition === "left"
+        ? { left: `${defaultEdgeDistance}px`, right: "auto" }
+        : { right: `${defaultEdgeDistance}px`, left: "auto" }
+      : { left: "", right: "" }
+
+  const [isHeaderPressed, setIsHeaderPressed] = useState(false)
+  const shouldShowHeaderPressHint = useCallback((target: EventTarget | null) => {
+    if (!(target instanceof Element)) {
+      return true
+    }
+
+    return !target.closest('.gh-panel-controls, [data-no-header-press-hint="true"]')
+  }, [])
+
+  const resetHeaderPressHint = useCallback(() => {
+    setIsHeaderPressed(false)
+  }, [])
+
+  const handleHeaderPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (!shouldShowHeaderPressHint(event.target)) {
+        resetHeaderPressHint()
+        return
+      }
+
+      setIsHeaderPressed(true)
+    },
+    [resetHeaderPressHint, shouldShowHeaderPressHint],
+  )
+
+  // 品牌区（logo）交互：未读更新日志时悬停短暂停留展示轻量预览，点击才打开完整更新日志
+  const brandHoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [isBrandPopoverOpen, setIsBrandPopoverOpen] = useState(false)
+
+  const handleBrandMouseEnter = useCallback(() => {
+    if (!hasUnseenReleaseNotes || !onOpenReleaseNotes) return
+    if (brandHoverTimerRef.current) clearTimeout(brandHoverTimerRef.current)
+    brandHoverTimerRef.current = setTimeout(() => {
+      setIsBrandPopoverOpen(true)
+    }, 300)
+  }, [hasUnseenReleaseNotes, onOpenReleaseNotes])
+
+  const handleBrandMouseLeave = useCallback(() => {
+    if (brandHoverTimerRef.current) {
+      clearTimeout(brandHoverTimerRef.current)
+      brandHoverTimerRef.current = null
+    }
+    setIsBrandPopoverOpen(false)
+  }, [])
+
+  const handleBrandClick = useCallback(() => {
+    if (brandHoverTimerRef.current) {
+      clearTimeout(brandHoverTimerRef.current)
+      brandHoverTimerRef.current = null
+    }
+    setIsBrandPopoverOpen(false)
+    onOpenReleaseNotes?.()
+  }, [onOpenReleaseNotes])
+
+  // Double click to toggle panel mode
+  const handleHeaderDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      // 忽略在控制按钮上的双击
+      const target = e.target
+      if (target instanceof Element && target.closest(".gh-panel-controls")) return
+
+      const current = currentSettings.panel?.panelMode ?? "floating"
+      if (current === "edge-snap" && panelRef.current) {
+        savedPeekingRectRef.current = panelRef.current.getBoundingClientRect()
+        prepareEdgeSnapToFloatingSwitch()
+      }
+      updateNestedSetting("panel", "panelMode", current === "edge-snap" ? "floating" : "edge-snap")
+    },
+    [
+      currentSettings.panel?.panelMode,
+      panelRef,
+      prepareEdgeSnapToFloatingSwitch,
+      updateNestedSetting,
+    ],
+  )
+
+  useEffect(() => {
+    return () => {
+      if (brandHoverTimerRef.current) clearTimeout(brandHoverTimerRef.current)
+    }
+  }, [])
+
+  // 初始化 activeTab（先用默认值，等 settings 加载后更新）
+  const [activeTab, setActiveTab] = useState<string>(() =>
+    visibleTabs.includes(TAB_IDS.PROMPTS) ? TAB_IDS.PROMPTS : visibleTabs[0] ?? "",
+  )
+  const [isInitialized, setIsInitialized] = useState(false)
+  const [draggedPanelTab, setDraggedPanelTab] = useState<string | null>(null)
+  const [dragOverPanelTab, setDragOverPanelTab] = useState<string | null>(null)
+  const suppressPanelTabClickRef = useRef(false)
+
+  // settings 加载完成后，设置为用户设置的首个 tab
+  useEffect(() => {
+    if (settings && !isInitialized) {
+      setActiveTab(visibleTabs[0] ?? "")
+      setIsInitialized(true)
+    }
+  }, [settings, isInitialized, visibleTabs])
+
+  // 当设置或能力变化时，如果当前 activeTab 不可见，则切换到首个可见 tab
+  useEffect(() => {
+    if (isInitialized && !visibleTabs.includes(activeTab)) {
+      setActiveTab(visibleTabs[0] ?? "")
+    }
+  }, [visibleTabs, isInitialized, activeTab])
+
+  // 监听快捷键触发的 tab 切换事件
+  useEffect(() => {
+    const handleSwitchToOutline = () => {
+      if (visibleTabs.includes(TAB_IDS.OUTLINE)) {
+        setActiveTab(TAB_IDS.OUTLINE)
+      }
+    }
+    const handleSwitchToConversations = () => {
+      if (visibleTabs.includes(TAB_IDS.CONVERSATIONS)) {
+        setActiveTab(TAB_IDS.CONVERSATIONS)
+      }
+    }
+
+    const handleSwitchTab = (e: CustomEvent<{ index: number }>) => {
+      const idx = e.detail?.index
+      if (typeof idx === "number" && visibleTabs[idx]) {
+        setActiveTab(visibleTabs[idx])
+      }
+    }
+
+    window.addEventListener("ophel:locateOutline", handleSwitchToOutline)
+    window.addEventListener("ophel:searchOutline", handleSwitchToOutline)
+    window.addEventListener("ophel:locateConversation", handleSwitchToConversations)
+    window.addEventListener("ophel:switchTab", handleSwitchTab as EventListener)
+
+    return () => {
+      window.removeEventListener("ophel:locateOutline", handleSwitchToOutline)
+      window.removeEventListener("ophel:searchOutline", handleSwitchToOutline)
+      window.removeEventListener("ophel:locateConversation", handleSwitchToConversations)
+      window.removeEventListener("ophel:switchTab", handleSwitchTab as EventListener)
+    }
+  }, [visibleTabs])
+
+  // 防止原生站点在面板输入时抢占焦点或吞掉按键
+  useEffect(() => {
+    if (!isOpen) {
+      return
+    }
+
+    const panel = panelRef.current
+    if (!panel) {
+      return
+    }
+
+    // 直接在面板元素上监听，覆盖 Shadow DOM 内部的输入控件
+    return attachEditableKeyboardFocusGuard(panel)
+  }, [isOpen, panelRef])
+
+  // === 锚点状态（使用全局存储） ===
+  const anchorPosition = useSyncExternalStore(anchorStore.subscribe, anchorStore.getSnapshot)
+  const hasAnchor = anchorPosition !== null
+  // 使用递增 id 而非 boolean，确保快速连续点击时每次都能重播动画
+  const [anchorTapId, setAnchorTapId] = useState(0)
+  // prefers-reduced-motion 下 animation 为 none，不会触发 animationend；用 timeout 充当兜底重置
+  useEffect(() => {
+    if (anchorTapId === 0) return
+    const timer = setTimeout(() => setAnchorTapId(0), 400)
+    return () => clearTimeout(timer)
+  }, [anchorTapId])
+
+  // === 加载状态（遮罩） ===
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false)
+  const [loadingText, setLoadingText] = useState("")
+  const abortLoadingRef = useRef(false)
+
+  // 滚动到顶部（自动记录当前位置为锚点，使用 HistoryLoader 加载全部历史）
+  const scrollToTop = useCallback(async () => {
+    await withAnchorOp(async () => {
+      // 遮罩延迟显示
+      const OVERLAY_DELAY_MS = 1600
+      abortLoadingRef.current = false
+
+      // 创建 AbortController 用于中断
+      const abortController = new AbortController()
+      const checkAbort = () => {
+        if (abortLoadingRef.current) {
+          abortController.abort()
+        }
+      }
+      const abortCheckInterval = setInterval(checkAbort, 100)
+
+      // 延迟显示遮罩的定时器
+      let overlayTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        if (!abortLoadingRef.current) {
+          setIsLoadingHistory(true)
+          setLoadingText(t("loadingHistory"))
+        }
+      }, OVERLAY_DELAY_MS)
+
+      try {
+        const result = await loadHistoryUntil({
+          adapter: adapter || null,
+          loadAll: true,
+          signal: abortController.signal,
+          allowShortCircuit: true, // 用户主动点击，启用短对话短路
+          onProgress: (msg) => {
+            setLoadingText(`${t("loadingHistory")} ${msg}`)
+          },
+        })
+        // 已在顶部时不覆盖锚点，避免重复点击丢失原位置
+        if (result.previousScrollTop >= 4) anchorStore.set(result.previousScrollTop)
+
+        // 清理遮罩
+        if (overlayTimer) {
+          clearTimeout(overlayTimer)
+          overlayTimer = null
+        }
+        setIsLoadingHistory(false)
+        setLoadingText("")
+
+        // 显示完成提示（静默模式不显示）
+        if (result.success && !result.silent) {
+          showToast(t("historyLoaded"), 2000)
+        }
+      } finally {
+        clearInterval(abortCheckInterval)
+        if (overlayTimer) {
+          clearTimeout(overlayTimer)
+        }
+      }
+    })
+  }, [adapter])
+
+  // 停止加载
+  const stopLoading = useCallback(() => {
+    abortLoadingRef.current = true
+  }, [])
+
+  // 滚动到底部（自动记录当前位置为锚点）
+  const scrollToBottom = useCallback(async () => {
+    await withAnchorOp(async () => {
+      const { previousScrollTop, container } = await smartScrollToBottom(adapter || null)
+      // 已在底部时不覆盖锚点，避免重复点击丢失原位置
+      const maxScroll = container.scrollHeight - container.clientHeight
+      if (container.clientHeight <= 0 || maxScroll - previousScrollTop >= 4) {
+        anchorStore.set(previousScrollTop)
+      }
+    })
+  }, [adapter])
+
+  // 跳转到锚点（实现位置交换，支持来回跳转）
+  const goToAnchor = useCallback(async () => {
+    await withAnchorOp(async () => {
+      const savedAnchor = anchorStore.get()
+      if (savedAnchor === null) return
+
+      // 触发按钮弹性动画
+      setAnchorTapId((id) => id + 1)
+
+      // 获取当前位置
+      const scrollInfo = await getScrollInfo(adapter || null)
+      const currentPos = scrollInfo.scrollTop
+
+      // 跳转到锚点
+      await smartScrollTo(adapter || null, savedAnchor)
+
+      // 交换位置
+      anchorStore.set(currentPos)
+    })
+  }, [adapter])
+
+  // 记录锚点位置（每次跳转大纲时调用）
+  const saveAnchor = useCallback(async () => {
+    const scrollInfo = await getScrollInfo(adapter || null)
+    anchorStore.set(scrollInfo.scrollTop)
+  }, [adapter])
+
+  const flushPendingResizeWidth = useCallback(() => {
+    resizeFrameRef.current = null
+    if (pendingResizeWidthRef.current === null) {
+      return
+    }
+
+    setDraftPanelWidth(pendingResizeWidthRef.current)
+  }, [])
+
+  const handlePanelPointerDownCapture = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      updatePanelPointerPosition(event)
+      lastPanelPointerDownAtRef.current = performance.now()
+    },
+    [updatePanelPointerPosition],
+  )
+
+  const handlePanelPointerEnter = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      updatePanelPointerPosition(event)
+      clearHoverWidthReleaseTimer()
+      setPanelHoveredState(true)
+      setIsHoverWidthRetained(true)
+      onMouseEnter?.(event)
+    },
+    [clearHoverWidthReleaseTimer, onMouseEnter, setPanelHoveredState, updatePanelPointerPosition],
+  )
+
+  const handlePanelPointerLeave = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      updatePanelPointerPosition(event)
+      setIsHoverWidthModeSwitchSuppressed(false)
+      setIsHoverWidthResizeSuppressed(false)
+      setPanelHoveredState(false)
+      scheduleHoverWidthRelease()
+      onMouseLeave?.(event)
+    },
+    [onMouseLeave, scheduleHoverWidthRelease, setPanelHoveredState, updatePanelPointerPosition],
+  )
+
+  const handlePanelFocus = useCallback(
+    (event: React.FocusEvent<HTMLDivElement>) => {
+      const target = event.target
+      const isPointerFocus = performance.now() - lastPanelPointerDownAtRef.current < 600
+      if (isPointerFocus || !(target instanceof HTMLElement) || !target.matches(":focus-visible")) {
+        return
+      }
+
+      clearHoverWidthReleaseTimer()
+      setPanelFocusWithinState(true)
+      setIsHoverWidthRetained(true)
+    },
+    [clearHoverWidthReleaseTimer, setPanelFocusWithinState],
+  )
+
+  const handlePanelBlur = useCallback(
+    (event: React.FocusEvent<HTMLDivElement>) => {
+      const relatedTarget = event.relatedTarget
+      if (relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget)) {
+        return
+      }
+
+      setPanelFocusWithinState(false)
+      scheduleHoverWidthRelease()
+    },
+    [scheduleHoverWidthRelease, setPanelFocusWithinState],
+  )
+
+  const handleResizePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const panel = panelRef.current
+      // 直接操控当前可见边缘：hover-width 生效时也从可见宽度开始拖拽，
+      // 结束后把拖拽结果写入基础宽度，避免 pointerdown 时手柄跳离指针。
+      const measuredWidth = panel?.getBoundingClientRect().width
+      const startWidth = clampPanelWidth(
+        measuredWidth && measuredWidth > 0 ? measuredWidth : panelWidth,
+      )
+
+      resizeStateRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth,
+        handleSide: resizeHandleSide,
+        hasMoved: false,
+      }
+      pendingResizeWidthRef.current = startWidth
+      setDraftPanelWidth(startWidth)
+      setPanelResizingState(true)
+      setIsHoverWidthRetained(true)
+      onInteractionStateChange?.(true)
+      event.currentTarget.setPointerCapture(event.pointerId)
+    },
+    [onInteractionStateChange, panelRef, panelWidth, resizeHandleSide, setPanelResizingState],
+  )
+
+  const handleResizePointerMove = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      const state = resizeStateRef.current
+      if (!state || state.pointerId !== event.pointerId) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const deltaX = event.clientX - state.startX
+      if (Math.abs(deltaX) >= 3) {
+        state.hasMoved = true
+      }
+      const nextWidth =
+        state.handleSide === "left"
+          ? clampPanelWidth(state.startWidth - deltaX)
+          : clampPanelWidth(state.startWidth + deltaX)
+
+      pendingResizeWidthRef.current = nextWidth
+      if (resizeFrameRef.current === null) {
+        resizeFrameRef.current = requestAnimationFrame(flushPendingResizeWidth)
+      }
+    },
+    [flushPendingResizeWidth],
+  )
+
+  const finishResize = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      const state = resizeStateRef.current
+      if (!state || state.pointerId !== event.pointerId) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      if (resizeFrameRef.current !== null) {
+        cancelAnimationFrame(resizeFrameRef.current)
+        resizeFrameRef.current = null
+      }
+
+      const finalWidth = clampPanelWidth(pendingResizeWidthRef.current ?? state.startWidth)
+      resizeStateRef.current = null
+      pendingResizeWidthRef.current = null
+      setDraftPanelWidth(null)
+      setPanelResizingState(false)
+      if (state.hasMoved) {
+        setIsHoverWidthRetained(false)
+        setIsHoverWidthResizeSuppressed(true)
+        updateNestedSetting("panel", "width", finalWidth)
+      }
+      onInteractionStateChange?.(false)
+
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId)
+      }
+
+      scheduleHoverWidthRelease()
+    },
+    [
+      onInteractionStateChange,
+      scheduleHoverWidthRelease,
+      setPanelResizingState,
+      updateNestedSetting,
+    ],
+  )
+
+  const isHoverWidthPreviewActive =
+    isHoverWidthActive && !isPanelResizing && panelWidth > basePanelWidth
+  const panelAnchorSide = resizeHandleSide === "left" ? "right" : "left"
+
+  if (!isOpen) return null
+
+  const canDragPanelTabs = visibleTabs.length > 1
+
+  const resetPanelTabDragState = () => {
+    setDraggedPanelTab(null)
+    setDragOverPanelTab(null)
+  }
+
+  const handlePanelTabDragStart = (event: React.DragEvent<HTMLButtonElement>, tab: string) => {
+    if (!canDragPanelTabs) {
+      event.preventDefault()
+      return
+    }
+
+    setDraggedPanelTab(tab)
+    setDragOverPanelTab(null)
+    event.dataTransfer.effectAllowed = "move"
+    event.dataTransfer.setData("text/plain", tab)
+  }
+
+  const handlePanelTabDragOver = (event: React.DragEvent<HTMLButtonElement>, tab: string) => {
+    if (!canDragPanelTabs || !draggedPanelTab || draggedPanelTab === tab) {
+      return
+    }
+
+    event.preventDefault()
+    event.dataTransfer.dropEffect = "move"
+    setDragOverPanelTab(tab)
+  }
+
+  const handlePanelTabDrop = (event: React.DragEvent<HTMLButtonElement>, targetTab: string) => {
+    if (!canDragPanelTabs) {
+      return
+    }
+
+    event.preventDefault()
+    const sourceTab = draggedPanelTab || event.dataTransfer.getData("text/plain")
+    if (!sourceTab || sourceTab === targetTab) {
+      resetPanelTabDragState()
+      return
+    }
+
+    const nextOrder = reorderVisiblePanelTabs(tabOrder, visibleTabs, sourceTab, targetTab)
+    if (nextOrder !== tabOrder) {
+      updateNestedSetting("features", "order", nextOrder)
+    }
+
+    suppressPanelTabClickRef.current = true
+    window.setTimeout(() => {
+      suppressPanelTabClickRef.current = false
+    }, 0)
+    resetPanelTabDragState()
+  }
+
+  const focusPanelTab = (tabListElement: HTMLElement | null, tab: string) => {
+    window.requestAnimationFrame(() => {
+      const nextTabId = `gh-panel-tab-${tab}`
+      const nextTabButton = Array.from(
+        tabListElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+      ).find((button) => button.id === nextTabId)
+
+      nextTabButton?.focus()
+    })
+  }
+
+  const handlePanelTabClick = (tab: string) => {
+    if (suppressPanelTabClickRef.current) {
+      return
+    }
+
+    setActiveTab(tab)
+  }
+
+  const handlePanelTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, tab: string) => {
+    if (suppressPanelTabClickRef.current || visibleTabs.length === 0) {
+      return
+    }
+
+    const currentIndex = visibleTabs.indexOf(tab)
+    if (currentIndex < 0) {
+      return
+    }
+
+    let nextTab: string | null = null
+    if (event.key === "ArrowLeft") {
+      nextTab = visibleTabs[(currentIndex - 1 + visibleTabs.length) % visibleTabs.length]
+    } else if (event.key === "ArrowRight") {
+      nextTab = visibleTabs[(currentIndex + 1) % visibleTabs.length]
+    } else if (event.key === "Home") {
+      nextTab = visibleTabs[0]
+    } else if (event.key === "End") {
+      nextTab = visibleTabs[visibleTabs.length - 1]
+    }
+
+    if (!nextTab) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    setActiveTab(nextTab)
+    focusPanelTab(event.currentTarget.parentElement, nextTab)
+  }
+
+  // 获取主题图标
+  const getThemeIcon = () => {
+    if (themeMode === "dark") {
+      // 深色模式时显示太阳图标（点击切换到浅色）
+      return <ThemeLightIcon size={14} />
+    }
+    // 浅色模式时显示月亮图标（点击切换到深色）
+    return <ThemeDarkIcon size={14} />
+  }
+
+  return (
+    <>
+      {/* 加载历史遮罩 */}
+      <LoadingOverlay isVisible={isLoadingHistory} text={loadingText} onStop={stopLoading} />
+      <div
+        ref={panelRef}
+        onMouseEnter={handlePanelPointerEnter}
+        onMouseLeave={handlePanelPointerLeave}
+        onPointerDownCapture={handlePanelPointerDownCapture}
+        onFocus={handlePanelFocus}
+        onBlur={handlePanelBlur}
+        className={`gh-main-panel gh-interactive ${!isLauncherPeeking && edgeSnapState ? `edge-snapped-${edgeSnapState}` : ""} ${isEdgeTriggerHidden ? "edge-trigger-hidden" : ""} ${isLauncherPeeking ? "launcher-peek" : ""} ${isEdgePeeking ? "edge-peek" : ""} ${isScrolling ? "scroll-hidden" : ""} ${isPanelResizing ? "is-resizing" : ""} ${isHoverWidthActive && !isPanelResizing ? "hover-width-active" : ""}`}
+        data-panel-hover-width-active={isHoverWidthPreviewActive ? "true" : undefined}
+        data-panel-base-width={basePanelWidth}
+        data-panel-anchor-side={panelAnchorSide}
+        style={
+          {
+            position: "fixed",
+            top: "50%",
+            // 仅在 floating 模式下通过 React style prop 设置位置；
+            // edge-snap 模式下由 useLayoutEffect + CSS class 控制，避免切换首帧
+            // 与后续重渲染写回 inline style 覆盖 CSS transition，导致动画抖动
+            ...panelPositionStyle,
+            transform: isLauncherPeeking ? "none" : "translateY(-50%)",
+            width: `${panelWidth}px`,
+            height: `${panelHeightVh}vh`,
+            "--panel-width": `${panelWidth}px`,
+            "--panel-base-width": `${basePanelWidth}px`,
+            minHeight: "500px",
+            backgroundColor: "var(--gh-bg, #ffffff)",
+            backgroundImage: "var(--gh-bg-image, none)",
+            backgroundBlendMode: "overlay",
+            animation: "var(--gh-bg-animation, none)",
+            borderRadius: "12px",
+            boxShadow: "var(--gh-shadow, 0 10px 40px rgba(0,0,0,0.15))",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+            border: "1px solid var(--gh-border, #e5e7eb)",
+            zIndex: 9999,
+            fontFamily: OPHEL_FONT_FAMILY_CSS_VAR,
+            // 位置现在由 useDraggable 通过直接 DOM 操作控制，不再通过 React state
+          } as React.CSSProperties
+        }>
+        {/* 自定义 CSS 注入：根据当前站点的样式 ID 查找自定义样式 */}
+        {currentCustomStyle ? <style>{currentCustomStyle.css}</style> : null}
+
+        {!isLauncherPeeking && !isEdgeSnapMode && (
+          <button
+            type="button"
+            className={`gh-panel-resize-handle gh-panel-resize-handle-${resizeHandleSide}`}
+            aria-label={t("panelResizeHandleLabel")}
+            title={t("panelResizeHandleLabel")}
+            data-no-header-press-hint="true"
+            onPointerDown={handleResizePointerDown}
+            onPointerMove={handleResizePointerMove}
+            onPointerUp={finishResize}
+            onPointerCancel={finishResize}
+            onLostPointerCapture={finishResize}
+          />
+        )}
+
+        {/* Header - 拖拽区域 */}
+        <div
+          ref={headerRef}
+          onPointerDown={handleHeaderPointerDown}
+          onPointerUp={resetHeaderPressHint}
+          onPointerLeave={resetHeaderPressHint}
+          onPointerCancel={resetHeaderPressHint}
+          onDoubleClick={handleHeaderDoubleClick}
+          className="gh-panel-header">
+          {/* 左侧：图标 + 标题，未读更新日志时显示红点，悬停/点击查看 */}
+          <div
+            className="gh-panel-brand"
+            onMouseEnter={handleBrandMouseEnter}
+            onMouseLeave={handleBrandMouseLeave}>
+            <div
+              className="gh-interactive gh-panel-brand-trigger"
+              role="button"
+              tabIndex={0}
+              aria-label={t("releaseNotesOpen")}
+              data-tip-target="header-title"
+              data-no-header-press-hint="true"
+              onClick={handleBrandClick}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault()
+                  handleBrandClick()
+                }
+              }}>
+              <div className="gh-panel-brand-mark">
+                <SparkleIcon size={18} color={panelSparkleColor} />
+                {hasUnseenReleaseNotes && (
+                  <span className="gh-panel-brand-unread" aria-hidden="true" />
+                )}
+              </div>
+              <span className="gh-panel-brand-title">{t("panelTitle")}</span>
+            </div>
+
+            {isBrandPopoverOpen && hasUnseenReleaseNotes && releaseNotesTitleText ? (
+              <div className="gh-brand-release-popover" role="status">
+                <div className="gh-brand-release-popover-title">{releaseNotesTitleText}</div>
+                {releaseNotesPreview ? (
+                  <p className="gh-brand-release-popover-preview">{releaseNotesPreview}</p>
+                ) : null}
+                <div className="gh-brand-release-popover-hint">{t("releaseNotesViewFull")}</div>
+              </div>
+            ) : null}
+          </div>
+
+          {/* 右侧：按钮组 - 需要 gh-panel-controls 以排除拖拽 */}
+          <div className="gh-panel-controls" data-no-header-press-hint="true">
+            {/* 面板模式切换按钮 */}
+            <Tooltip
+              content={
+                (currentSettings.panel?.panelMode ?? "floating") === "edge-snap"
+                  ? t("pinPanel")
+                  : t("snapToEdge")
+              }>
+              <button
+                type="button"
+                aria-label={
+                  (currentSettings.panel?.panelMode ?? "floating") === "edge-snap"
+                    ? t("pinPanel")
+                    : t("snapToEdge")
+                }
+                onClick={() => {
+                  const current = currentSettings.panel?.panelMode ?? "floating"
+                  // 从吸附切换到悬浮时，保存当前可见位置用于保留垂直位置
+                  if (current === "edge-snap" && panelRef.current) {
+                    savedPeekingRectRef.current = panelRef.current.getBoundingClientRect()
+                    prepareEdgeSnapToFloatingSwitch()
+                  }
+                  updateNestedSetting(
+                    "panel",
+                    "panelMode",
+                    current === "edge-snap" ? "floating" : "edge-snap",
+                  )
+                }}
+                className="gh-header-icon-btn">
+                {(currentSettings.panel?.panelMode ?? "floating") === "edge-snap" ? (
+                  <FloatingModeIcon size={14} />
+                ) : (
+                  <SnapToEdgeIcon size={14} />
+                )}
+              </button>
+            </Tooltip>
+
+            {/* 主题切换按钮 */}
+            {onThemeToggle && (
+              <Tooltip content={t("toggleTheme")}>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    onThemeToggle?.(getButtonCenter(event.currentTarget))
+                  }}
+                  className="gh-header-icon-btn">
+                  {getThemeIcon()}
+                </button>
+              </Tooltip>
+            )}
+
+            {/* 新标签页按钮 - 受 openInNewTab 设置控制 */}
+            {currentSettings.tab?.openInNewTab && canOpenNewTab && (
+              <Tooltip content={t("newTabTooltip")}>
+                <button
+                  type="button"
+                  onClick={() => window.open(window.location.origin, "_blank")}
+                  className="gh-header-icon-btn">
+                  <NewTabIcon size={14} />
+                </button>
+              </Tooltip>
+            )}
+
+            {/* 设置按钮 - 打开设置模态框 */}
+            <Tooltip content={t("tabSettings")}>
+              <button
+                type="button"
+                data-tip-target="settings-btn"
+                onClick={() => {
+                  onOpenSettings?.()
+                }}
+                className="gh-header-icon-btn">
+                <SettingsIcon size={14} />
+              </button>
+            </Tooltip>
+
+            {/* 刷新按钮 - 暂时隐藏，数据已是响应式自动更新 */}
+            {/* <Tooltip
+              content={
+                activeTab === TAB_IDS.OUTLINE
+                  ? t("refreshOutline")
+                  : activeTab === TAB_IDS.PROMPTS
+                    ? t("refreshPrompts")
+                    : activeTab === TAB_IDS.CONVERSATIONS
+                      ? t("refreshConversations")
+                      : t("refresh")
+              }>
+              <button
+                onClick={() => {
+                  if (activeTab === TAB_IDS.OUTLINE) {
+                    outlineManager?.refresh()
+                  } else if (activeTab === TAB_IDS.PROMPTS) {
+                    promptManager?.init()
+                  } else if (activeTab === TAB_IDS.CONVERSATIONS) {
+                    conversationManager?.notifyDataChange()
+                  }
+                }}
+                className="gh-header-icon-btn">
+                <RefreshIcon size={14} />
+              </button>
+            </Tooltip> */}
+
+            {/* 折叠按钮（收起面板） */}
+            <Tooltip content={t("collapse")}>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label={t("collapse")}
+                className="gh-header-icon-btn">
+                <MinimizeIcon size={14} />
+              </button>
+            </Tooltip>
+          </div>
+        </div>
+
+        {/* 拖拽/悬停 即时提示层 (幽灵模式) */}
+        <div className={`gh-panel-header-hint ${isHeaderPressed ? "is-visible" : ""}`}>
+          <span className="gh-panel-header-hint-icon" aria-hidden="true">
+            <DragIcon size={14} />
+          </span>
+          <span className="gh-panel-header-hint-text">
+            {t("tip1", { modifier: isMacOS() ? "⌘ Cmd" : "Ctrl" })}
+          </span>
+        </div>
+        <div className="gh-panel-tabs" role="tablist" aria-label={t("panelTitle")}>
+          {visibleTabs.map((tab) => {
+            let IconComp: React.FC<{ size?: number }> | null = null
+            if (tab === TAB_IDS.OUTLINE) IconComp = OutlineIcon
+            else if (tab === TAB_IDS.PROMPTS) IconComp = PromptIcon
+            else if (tab === TAB_IDS.CONVERSATIONS) IconComp = ConversationIcon
+
+            return (
+              <button
+                type="button"
+                key={tab}
+                id={`gh-panel-tab-${tab}`}
+                role="tab"
+                draggable={canDragPanelTabs}
+                aria-selected={activeTab === tab}
+                aria-controls={`gh-panel-tabpanel-${tab}`}
+                aria-grabbed={draggedPanelTab === tab}
+                className={`gh-panel-tab-btn ${activeTab === tab ? "active" : ""} ${canDragPanelTabs ? "is-draggable" : ""} ${draggedPanelTab === tab ? "is-dragging" : ""} ${dragOverPanelTab === tab ? "is-drag-over" : ""}`}
+                data-tip-target={
+                  tab === TAB_IDS.OUTLINE
+                    ? "outline-tab"
+                    : tab === TAB_IDS.CONVERSATIONS
+                      ? "conversations-tab"
+                      : tab === TAB_IDS.PROMPTS
+                        ? "prompts-tab"
+                        : undefined
+                }
+                onClick={() => handlePanelTabClick(tab)}
+                onKeyDown={(event) => handlePanelTabKeyDown(event, tab)}
+                onDragStart={(event) => handlePanelTabDragStart(event, tab)}
+                onDragOver={(event) => handlePanelTabDragOver(event, tab)}
+                onDragEnter={(event) => handlePanelTabDragOver(event, tab)}
+                onDragLeave={() => {
+                  if (dragOverPanelTab === tab) {
+                    setDragOverPanelTab(null)
+                  }
+                }}
+                onDrop={(event) => handlePanelTabDrop(event, tab)}
+                onDragEnd={resetPanelTabDragState}>
+                <span className="gh-panel-tab-btn-icon">{IconComp && <IconComp size={16} />}</span>
+                <span className="gh-panel-tab-btn-label">
+                  {t(`tab${tab.charAt(0).toUpperCase() + tab.slice(1)}`)}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        {/* Content - 内容区 */}
+        {visibleTabs.includes(activeTab) && (
+          <div
+            id={`gh-panel-tabpanel-${activeTab}`}
+            className="gh-panel-content"
+            role="tabpanel"
+            aria-labelledby={`gh-panel-tab-${activeTab}`}>
+            {activeTab === TAB_IDS.PROMPTS && (
+              <PromptsTab
+                manager={promptManager}
+                adapter={adapter}
+                currentPlatform={currentPromptPlatform}
+                selectedPlatforms={selectedPromptPlatforms}
+                setSelectedPlatforms={setSelectedPromptPlatforms}
+                selectedPromptId={selectedPromptId}
+                onPromptSelect={onPromptSelect}
+              />
+            )}
+            {activeTab === TAB_IDS.CONVERSATIONS && (
+              <ConversationsTab
+                manager={conversationManager}
+                onInteractionStateChange={onInteractionStateChange}
+              />
+            )}
+            {activeTab === TAB_IDS.OUTLINE && (
+              <OutlineTab
+                manager={outlineManager}
+                conversationManager={conversationManager}
+                onJumpBefore={saveAnchor}
+                showUserQueryToggle={canShowOutlineUserQueries}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Footer - 底部固定按钮 */}
+        <div className="gh-panel-footer">
+          {/* 顶部按钮 */}
+          <Tooltip
+            content={t("scrollTop")}
+            placement="top"
+            triggerStyle={{ flex: 1, maxWidth: "120px" }}>
+            <button
+              type="button"
+              className="gh-interactive scroll-nav-btn gh-panel-footer-action"
+              onClick={scrollToTop}>
+              <ScrollTopIcon size={14} />
+              <span>{t("scrollTop")}</span>
+            </button>
+          </Tooltip>
+
+          {/* 锚点按钮（返回之前位置，双向跳转） */}
+          <Tooltip
+            content={hasAnchor ? t("jumpToAnchor") : t("noAnchor")}
+            placement="top"
+            triggerStyle={{ flex: "0 0 32px" }}>
+            <button
+              type="button"
+              className="gh-interactive scroll-nav-btn anchor-btn gh-panel-footer-anchor"
+              onClick={goToAnchor}
+              disabled={!hasAnchor}>
+              {/* 动画目标：独立于按钮的 inline transform，key 变化强制重新挂载以重播动画 */}
+              <span
+                key={anchorTapId}
+                className={`anchor-tap-wrapper${anchorTapId > 0 ? " is-tapping" : ""}`}
+                onAnimationEnd={() => setAnchorTapId(0)}>
+                <div className="gh-panel-footer-anchor-icon">
+                  <AnchorIcon size={14} />
+                </div>
+              </span>
+            </button>
+          </Tooltip>
+
+          {/* 底部按钮 */}
+          <Tooltip
+            content={t("scrollBottom")}
+            placement="top"
+            triggerStyle={{ flex: 1, maxWidth: "120px" }}>
+            <button
+              type="button"
+              className="gh-interactive scroll-nav-btn gh-panel-footer-action"
+              onClick={scrollToBottom}>
+              <ScrollBottomIcon size={14} />
+              <span>{t("scrollBottom")}</span>
+            </button>
+          </Tooltip>
+        </div>
+      </div>
+    </>
+  )
+}

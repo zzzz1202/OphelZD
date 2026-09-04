@@ -1,0 +1,3124 @@
+/**
+ * DeepSeek 适配器（chat.deepseek.com）
+ *
+ * 选择器策略：
+ * - 优先使用 `ds-*` 语义类名
+ * - 会话列表优先使用 `/a/chat/s/{id}` 路由结构
+ * - 对用户消息采用“消息容器内不存在 `.ds-markdown`”的结构判断
+ *
+ * 注意：DeepSeek 页面存在部分 CSS Modules 哈希类名，首版实现尽量避免依赖它们。
+ */
+import { SITE_IDS } from "~constants"
+import { deepseekNativeThemeCss } from "~styles/native-theme-adapters/deepseek"
+import {
+  createExportAssetCollector,
+  formatExportFileAttachments,
+  formatExportImageAttachments,
+  isDownloadableExportAssetUrl,
+  normalizeExportAssetUrl,
+  type ExportAssetCollector,
+} from "~utils/export-assets"
+import { htmlToMarkdown, type ExportBundle } from "~utils/exporter"
+import { t } from "~utils/i18n"
+
+import {
+  SiteAdapter,
+  type ConversationDeleteTarget,
+  type ConversationInfo,
+  type ConversationObserverConfig,
+  type ExportConfig,
+  type ExportLifecycleContext,
+  type NetworkMonitorConfig,
+  type OutlineItem,
+  type PanelAvoidanceConfig,
+  type SiteDeleteConversationResult,
+  type ZenModeConfig,
+} from "./base"
+import {
+  DEEPSEEK_CONFIG,
+  DEEPSEEK_CONFIG_VERSION,
+  type DeepSeekSiteConfig,
+} from "./deepseek-config"
+import type { BuiltinSiteConfig } from "./declarative"
+
+const CHAT_PATH_PATTERN = /\/a\/chat\/s\/([a-z0-9-]+)/i
+const SHARE_PATH_PATTERN = /\/share\/([a-z0-9-]+)/i
+const TOKEN_STORAGE_PREFIX = "__tea_cache_tokens_"
+const THEME_STORAGE_KEY = "__appKit_@deepseek/chat_themePreference"
+const USER_TOKEN_STORAGE_KEY = "userToken"
+const OUTLINE_HEADING_SELECTOR = "h1, h2, h3, h4, h5, h6"
+const CHAT_DELETE_API_PATH = "/api/v0/chat_session/delete"
+const DEEPSEEK_HOME_URL = "https://chat.deepseek.com/"
+const DELETE_REFRESH_STORAGE_KEY = "gh.deepseek.delete.refresh"
+const DEEPSEEK_EXPORT_ROOT_ATTR = "data-gh-deepseek-export-root"
+const DEEPSEEK_EXPORT_ROLE_ATTR = "data-gh-deepseek-export-role"
+const DEEPSEEK_EXPORT_ROLE_USER = "user"
+const DEEPSEEK_EXPORT_ROLE_ASSISTANT = "assistant"
+const DEEPSEEK_EXPORT_USER_SELECTOR = `[${DEEPSEEK_EXPORT_ROOT_ATTR}="1"] [${DEEPSEEK_EXPORT_ROLE_ATTR}="${DEEPSEEK_EXPORT_ROLE_USER}"]`
+const DEEPSEEK_EXPORT_ASSISTANT_SELECTOR = `[${DEEPSEEK_EXPORT_ROOT_ATTR}="1"] [${DEEPSEEK_EXPORT_ROLE_ATTR}="${DEEPSEEK_EXPORT_ROLE_ASSISTANT}"]`
+const NATIVE_OUTLINE_SETTLE_MS = 120
+const USER_QUERY_REVEAL_TIMEOUT_MS = 3200
+const USER_QUERY_REVEAL_INTERVAL_MS = 80
+
+const DEEPSEEK_DELETE_REASON = {
+  MISSING_AUTH_TOKEN: "delete_api_missing_auth_token",
+  API_REQUEST_FAILED: "delete_api_request_failed",
+  API_INVALID_RESPONSE: "delete_api_invalid_response",
+  API_BUSINESS_FAILED: "delete_api_business_failed",
+} as const
+
+interface DeepSeekNativeOutlineEntry {
+  text: string
+  scrollTop?: number
+  batchIndex?: number
+}
+
+interface DeepSeekNativeOutlineCache {
+  sessionId: string
+  snapshot: string
+  items: DeepSeekNativeOutlineEntry[]
+}
+
+interface DeepSeekExportMessageSnapshot {
+  role: "user" | "assistant"
+  content: string
+}
+
+interface DeepSeekUserAttachment {
+  kind: "image" | "file"
+  name: string
+  type: string
+  size: string
+  source: string
+}
+
+export class DeepSeekAdapter extends SiteAdapter {
+  private config: DeepSeekSiteConfig = DEEPSEEK_CONFIG
+  private nativeOutlineCache: DeepSeekNativeOutlineCache | null = null
+  private nativeOutlineRevealRequestId = 0
+  private exportSnapshotRoot: HTMLElement | null = null
+  private exportSnapshotActive = false
+  private exportIncludeThoughtsOverride: boolean | null = null
+  private exportBundleCache: ExportBundle | null = null
+
+  match(): boolean {
+    const isMatch = window.location.hostname === "chat.deepseek.com"
+    if (isMatch) {
+      this.consumePendingDeleteRefresh()
+    }
+    return isMatch
+  }
+
+  getSiteId(): string {
+    return SITE_IDS.DEEPSEEK
+  }
+
+  getName(): string {
+    return "DeepSeek"
+  }
+
+  getBuiltinConfig(): DeepSeekSiteConfig {
+    return DEEPSEEK_CONFIG
+  }
+
+  getBuiltinConfigVersion(): number {
+    return DEEPSEEK_CONFIG_VERSION
+  }
+
+  applyMergedConfig(config: BuiltinSiteConfig): void {
+    this.config = config as DeepSeekSiteConfig
+  }
+
+  getThemeColors(): { primary: string; secondary: string } {
+    return { primary: "#4b6bfe", secondary: "#3a5ae0" }
+  }
+
+  getNativeThemeCss(): string | null {
+    return deepseekNativeThemeCss
+  }
+
+  getTextareaSelectors(): string[] {
+    return [...this.config.selectors.textarea]
+  }
+
+  getSubmitKeyConfig(): { key: "Enter" | "Ctrl+Enter" } {
+    return { key: this.config.input.submitKey ?? "Enter" }
+  }
+
+  getQuickQuoteSupportMode() {
+    return this.config.quickQuote
+  }
+
+  insertPrompt(content: string): boolean {
+    const el = this.getTextareaElement() as HTMLTextAreaElement | null
+    if (!el || !el.isConnected) return false
+
+    el.focus()
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set
+    if (setter) {
+      setter.call(el, content)
+    } else {
+      el.value = content
+    }
+
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: content }))
+    el.dispatchEvent(new Event("change", { bubbles: true }))
+    el.setSelectionRange(content.length, content.length)
+    return true
+  }
+
+  clearTextarea(): void {
+    const el = this.getTextareaElement() as HTMLTextAreaElement | null
+    if (!el || !el.isConnected) return
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set
+    if (setter) {
+      setter.call(el, "")
+    } else {
+      el.value = ""
+    }
+
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: "" }))
+    el.dispatchEvent(new Event("change", { bubbles: true }))
+    el.setSelectionRange(0, 0)
+  }
+
+  getSessionId(): string {
+    const path = window.location.pathname
+    const chatMatch = path.match(CHAT_PATH_PATTERN)
+    if (chatMatch?.[1]) {
+      return chatMatch[1]
+    }
+
+    const shareMatch = path.match(SHARE_PATH_PATTERN)
+    return shareMatch?.[1] || ""
+  }
+
+  isNewConversation(): boolean {
+    const path = window.location.pathname
+    if (this.isSharePage()) return false
+
+    return (
+      path === "/" || path === "/a/chat" || path === "/a/chat/" || !CHAT_PATH_PATTERN.test(path)
+    )
+  }
+
+  isSharePage(): boolean {
+    // 自有会话：/a/chat/s/ID    分享会话：/share/ID
+    return window.location.pathname.startsWith("/share/")
+  }
+
+  getNewTabUrl(): string {
+    return "https://chat.deepseek.com/"
+  }
+
+  getSessionName(): string | null {
+    const conversationTitle = this.getConversationTitle()
+    if (conversationTitle) return conversationTitle
+
+    const title = this.getDocumentConversationTitle() || ""
+    if (!title || title === "DeepSeek") return null
+
+    return title.replace(/\s*[-|]\s*DeepSeek$/i, "").trim() || null
+  }
+
+  getCurrentCid(): string | null {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (!key || !key.startsWith(TOKEN_STORAGE_PREFIX)) continue
+
+        const raw = localStorage.getItem(key)
+        if (!raw) continue
+
+        const data = JSON.parse(raw) as Record<string, unknown>
+        const uid = data.user_unique_id
+        if (typeof uid === "string" && uid) {
+          return uid
+        }
+      }
+    } catch {
+      // ignore malformed localStorage data
+    }
+
+    return null
+  }
+
+  getConversationList(): ConversationInfo[] {
+    const cid = this.getCurrentCid() || undefined
+    const links = document.querySelectorAll(this.config.conversation.itemSelector)
+    const map = new Map<string, ConversationInfo>()
+
+    links.forEach((link) => {
+      const info = this.extractConversationInfo(link, cid)
+      if (info) {
+        map.set(info.id, info)
+      }
+    })
+
+    return Array.from(map.values())
+  }
+
+  getConversationObserverConfig(): ConversationObserverConfig {
+    return {
+      selector: this.config.conversation.itemSelector,
+      shadow: this.config.conversation.shadow ?? false,
+      extractInfo: (el) => this.extractConversationInfo(el, this.getCurrentCid() || undefined),
+      getTitleElement: (el) => this.findTitleElement(el),
+    }
+  }
+
+  async deleteConversationOnSite(
+    target: ConversationDeleteTarget,
+  ): Promise<SiteDeleteConversationResult> {
+    const currentSessionId = this.getSessionId()
+    const token = this.getUserToken()
+    if (!token) {
+      return {
+        id: target.id,
+        success: false,
+        method: "api",
+        reason: DEEPSEEK_DELETE_REASON.MISSING_AUTH_TOKEN,
+      }
+    }
+
+    const result = await this.deleteConversationViaApi(target, token)
+    if (result.success) {
+      if (target.id === currentSessionId) {
+        this.scheduleHomeRefreshAfterDelete()
+      } else {
+        this.schedulePageReloadAfterDelete()
+      }
+    }
+    return result
+  }
+
+  async deleteConversationsOnSite(
+    targets: ConversationDeleteTarget[],
+  ): Promise<SiteDeleteConversationResult[]> {
+    if (targets.length === 0) {
+      return []
+    }
+
+    const currentSessionId = this.getSessionId()
+    const token = this.getUserToken()
+    if (!token) {
+      return targets.map((target) => ({
+        id: target.id,
+        success: false,
+        method: "api",
+        reason: DEEPSEEK_DELETE_REASON.MISSING_AUTH_TOKEN,
+      }))
+    }
+
+    const results: SiteDeleteConversationResult[] = []
+    let deletedCurrentSession = false
+    let hasSuccessfulDeletion = false
+
+    for (const target of targets) {
+      const result = await this.deleteConversationViaApi(target, token)
+      results.push(result)
+      if (result.success) {
+        hasSuccessfulDeletion = true
+        if (target.id === currentSessionId) {
+          deletedCurrentSession = true
+        }
+      }
+    }
+
+    if (hasSuccessfulDeletion) {
+      if (deletedCurrentSession) {
+        this.scheduleHomeRefreshAfterDelete()
+      } else {
+        this.schedulePageReloadAfterDelete()
+      }
+    }
+
+    return results
+  }
+
+  getConversationTitle(): string | null {
+    if (this.isSharePage()) {
+      return this.getShareConversationTitle()
+    }
+
+    const sessionId = this.getSessionId()
+    const conversationLink = this.config.conversation.itemSelector
+    const activeMatch = this.config.conversation.activeMatch
+    const activeLink =
+      (sessionId
+        ? document.querySelector(`${conversationLink}[href*="/a/chat/s/${sessionId}"]`)
+        : null) ||
+      (activeMatch
+        ? Array.from(document.querySelectorAll(conversationLink)).find((link) =>
+            link.matches(activeMatch),
+          )
+        : null)
+
+    if (!activeLink) return null
+    return this.extractConversationTitle(activeLink)
+  }
+
+  navigateToConversation(id: string, url?: string): boolean {
+    if ((this.config.conversation.navigationStrategy ?? "click-item") !== "location") {
+      const conversationLink = this.config.conversation.itemSelector
+      const link = document.querySelector(
+        `${conversationLink}[href*="/a/chat/s/${id}"]`,
+      ) as HTMLElement | null
+
+      if (link) {
+        link.click()
+        return true
+      }
+    }
+
+    const path = this.config.conversation.urlTemplate.replace("{id}", encodeURIComponent(id))
+    return super.navigateToConversation(id, url || new URL(path, DEEPSEEK_HOME_URL).toString())
+  }
+
+  getSidebarScrollContainer(): Element | null {
+    const firstLink = document.querySelector(this.config.conversation.itemSelector)
+    return firstLink?.closest(this.config.sitePrivateSelectors.sidebarScrollArea) || null
+  }
+
+  getZenModeConfig() {
+    const { hide, rootClass, styles } = this.config.zenMode
+    return {
+      ...(hide ? { hide: [...hide] } : {}),
+      ...(rootClass ? { rootClass: { ...rootClass } } : {}),
+      ...(styles ? { styles: styles.map((style) => ({ ...style })) } : {}),
+    }
+  }
+
+  getCleanModeConfig(): ZenModeConfig | null {
+    const { hide, rootClass, styles } = this.config.cleanMode
+    return {
+      ...(hide ? { hide: [...hide] } : {}),
+      ...(rootClass ? { rootClass: { ...rootClass } } : {}),
+      ...(styles ? { styles: styles.map((style) => ({ ...style })) } : {}),
+    }
+  }
+
+  getScrollContainer(): HTMLElement | null {
+    const messageSelector = this.config.sitePrivateSelectors.message
+    const topLevelMessages = Array.from(document.querySelectorAll(messageSelector)).filter(
+      (message) => !message.parentElement?.closest(messageSelector),
+    )
+    const fromMessages = this.pickBestScrollableAncestor(topLevelMessages)
+    if (fromMessages) {
+      return fromMessages
+    }
+
+    const fallbackRoots = Array.from(
+      document.querySelectorAll(
+        `${this.config.selectors.assistantResponse}, ${this.config.selectors.userQuery}`,
+      ),
+    ).filter((element) => !element.closest(".gh-root, .gh-table-container"))
+    return this.pickBestScrollableAncestor(fallbackRoots)
+  }
+
+  getResponseContainerSelector(): string {
+    return this.config.selectors.responseContainer
+  }
+
+  getUserQuerySelector(): string {
+    return this.config.selectors.userQuery
+  }
+
+  findUserQueryElement(queryIndex: number, text: string): Element | null {
+    const elements = this.getVisibleUserQueryElements()
+    if (elements.length === 0) return null
+
+    if (queryIndex > 0 && elements.length >= queryIndex) {
+      const candidate = elements[queryIndex - 1]
+      if (this.isEquivalentUserQueryText(this.extractUserQueryText(candidate), text)) {
+        return candidate
+      }
+    }
+
+    return (
+      elements.find((element) =>
+        this.isEquivalentUserQueryText(this.extractUserQueryText(element), text),
+      ) || null
+    )
+  }
+
+  getChatContentSelectors(): string[] {
+    return [...this.config.selectors.chatContent]
+  }
+
+  scrollToOutlineTarget(element: HTMLElement): void {
+    this.nativeOutlineRevealRequestId += 1
+    super.scrollToOutlineTarget(element)
+  }
+
+  extractUserQueryText(element: Element): string {
+    if (this.isExportSnapshotElement(element)) {
+      return element.textContent?.trim() || ""
+    }
+
+    const source = this.findUserContentRoot(element)
+    if (!source) {
+      if (this.resolveUserMessageElement(element)) {
+        return ""
+      }
+      return this.extractTextWithLineBreaks(element).trim()
+    }
+
+    const clone = source.cloneNode(true) as HTMLElement
+
+    clone
+      .querySelectorAll(
+        `.gh-user-query-markdown, button, [role=button], svg, ${this.config.sitePrivateSelectors.iconButton}, [aria-hidden=true]`,
+      )
+      .forEach((node) => node.remove())
+
+    return this.extractTextWithLineBreaks(clone).trim()
+  }
+
+  extractUserQueryMarkdown(element: Element): string {
+    return this.extractUserQueryText(element)
+  }
+
+  extractUserQueryExportContent(element: Element): string {
+    return this.extractDeepSeekUserQueryExportContent(element)
+  }
+
+  replaceUserQueryContent(element: Element, html: string): boolean {
+    const contentRoot = this.findUserContentRoot(element)
+    if (!contentRoot) return false
+    if (element.querySelector(".gh-user-query-markdown")) return false
+
+    const rendered = document.createElement("div")
+    rendered.className =
+      `${contentRoot instanceof HTMLElement ? contentRoot.className : ""} gh-user-query-markdown gh-user-query-markdown-deepseek gh-markdown-preview`.trim()
+    rendered.innerHTML = html
+
+    if (contentRoot instanceof HTMLElement) {
+      const inlineStyle = contentRoot.getAttribute("style")
+      if (inlineStyle) {
+        rendered.setAttribute("style", inlineStyle)
+      }
+    }
+
+    if (contentRoot === element) {
+      const rawWrapper = document.createElement("div")
+      rawWrapper.className = "gh-user-query-raw"
+      while (element.firstChild) {
+        rawWrapper.appendChild(element.firstChild)
+      }
+      rawWrapper.style.display = "none"
+      element.appendChild(rawWrapper)
+      element.appendChild(rendered)
+      return true
+    }
+
+    ;(contentRoot as HTMLElement).style.display = "none"
+    contentRoot.after(rendered)
+    return true
+  }
+
+  extractAssistantResponseText(element: Element): string {
+    if (this.isExportSnapshotElement(element)) {
+      return element.textContent?.trim() || ""
+    }
+
+    const includeThoughts = this.shouldIncludeThoughtsInExport()
+    const assistantMessage = this.resolveAssistantMessageElement(element)
+    const bodyMarkdown = this.resolveAssistantBodyMarkdownElement(element)
+    const thoughtBlocks =
+      includeThoughts && assistantMessage
+        ? this.extractThoughtBlockquotesFromMessage(assistantMessage)
+        : []
+
+    const content = bodyMarkdown ? this.extractMarkdownText(bodyMarkdown) : ""
+    if (includeThoughts && thoughtBlocks.length > 0) {
+      return content ? `${thoughtBlocks.join("\n\n")}\n\n${content}` : thoughtBlocks.join("\n\n")
+    }
+
+    return content
+  }
+
+  extractOutline(maxLevel = 6, includeUserQueries = false, showWordCount = false): OutlineItem[] {
+    const container =
+      this.getScrollContainer() || document.querySelector(this.getResponseContainerSelector())
+    if (!container) return []
+
+    const outline: OutlineItem[] = []
+    const domUserQueries: OutlineItem[] = []
+    const messageSelector = this.config.sitePrivateSelectors.message
+    const messages = Array.from(container.querySelectorAll(messageSelector)).filter(
+      (message) => !message.parentElement?.closest(messageSelector),
+    )
+
+    messages.forEach((message, index) => {
+      const markdown = this.getAssistantBodyMarkdown(message)
+
+      if (!markdown) {
+        if (!includeUserQueries) return
+
+        const text = this.extractUserQueryMarkdown(message)
+        if (!text) return
+
+        let wordCount: number | undefined
+        if (showWordCount) {
+          wordCount =
+            this.findNextAssistantMarkdown(messages, index)?.textContent?.trim().length || 0
+        }
+
+        const item = this.createUserQueryOutlineItem(text, message as HTMLElement, wordCount)
+        domUserQueries.push(item)
+        outline.push(item)
+        return
+      }
+
+      const headings = Array.from(markdown.querySelectorAll(OUTLINE_HEADING_SELECTOR))
+      headings.forEach((heading, headingIndex) => {
+        const level = Number.parseInt(heading.tagName.slice(1), 10)
+        if (Number.isNaN(level) || level > maxLevel) return
+
+        const text = heading.textContent?.trim() || ""
+        if (!text) return
+
+        let wordCount: number | undefined
+        if (showWordCount) {
+          let nextBoundary: Element | null = null
+          for (let i = headingIndex + 1; i < headings.length; i++) {
+            const candidate = headings[i]
+            const candidateLevel = Number.parseInt(candidate.tagName.slice(1), 10)
+            if (!Number.isNaN(candidateLevel) && candidateLevel <= level) {
+              nextBoundary = candidate
+              break
+            }
+          }
+          wordCount = this.calculateRangeWordCount(heading, nextBoundary, markdown)
+        }
+
+        outline.push({
+          level,
+          text,
+          element: heading as HTMLElement,
+          wordCount,
+        })
+      })
+    })
+
+    if (!includeUserQueries) {
+      return outline
+    }
+
+    const nativeUserQueries = this.extractNativeUserQueries(domUserQueries)
+    if (nativeUserQueries.length <= domUserQueries.length) {
+      return outline
+    }
+
+    return this.mergeOutlineWithNativeUserQueries(outline, nativeUserQueries)
+  }
+
+  async resolveOutlineTarget(
+    item: Pick<OutlineItem, "level" | "text" | "isUserQuery">,
+    queryIndex?: number,
+  ): Promise<Element | null> {
+    const isUserQueryTarget = item.isUserQuery && item.level === 0 && queryIndex !== undefined
+    const revealRequestId = isUserQueryTarget
+      ? ++this.nativeOutlineRevealRequestId
+      : this.nativeOutlineRevealRequestId
+
+    const directTarget = await super.resolveOutlineTarget(item, queryIndex)
+    if (directTarget) {
+      return directTarget
+    }
+
+    if (!isUserQueryTarget) {
+      return null
+    }
+
+    const jumped = await this.revealUserQueryThroughNativeOutline(
+      queryIndex,
+      item.text,
+      revealRequestId,
+    )
+    if (!jumped) {
+      return null
+    }
+
+    return this.waitForUserQueryElement(queryIndex, item.text, revealRequestId)
+  }
+
+  private createUserQueryOutlineItem(
+    text: string,
+    element: Element | null,
+    wordCount?: number,
+  ): OutlineItem {
+    const normalizedText = this.normalizeOutlineText(text)
+    const isTruncated = normalizedText.length > 80
+
+    return {
+      level: 0,
+      text: isTruncated ? `${normalizedText.slice(0, 80)}...` : normalizedText,
+      element,
+      isUserQuery: true,
+      isTruncated,
+      wordCount,
+    }
+  }
+
+  getExportConfig(): ExportConfig {
+    if (this.exportSnapshotActive) {
+      return {
+        userQuerySelector: DEEPSEEK_EXPORT_USER_SELECTOR,
+        assistantResponseSelector: DEEPSEEK_EXPORT_ASSISTANT_SELECTOR,
+        turnSelector: null,
+        useShadowDOM: false,
+      }
+    }
+
+    return { ...this.config.export }
+  }
+
+  async prepareConversationExport(context: ExportLifecycleContext): Promise<unknown> {
+    this.exportIncludeThoughtsOverride = context.includeThoughts
+    this.exportBundleCache = null
+    this.clearExportSnapshot()
+
+    const collector =
+      context.format === "markdown" && context.packaging === "zip"
+        ? createExportAssetCollector()
+        : undefined
+    const shareMessages = await this.collectShareExportMessageSnapshots(collector)
+    if (shareMessages?.length) {
+      if (collector) {
+        this.exportBundleCache = {
+          messages: shareMessages,
+          assets: collector.assets,
+        }
+      }
+
+      this.mountExportSnapshot(shareMessages)
+      return { count: shareMessages.length }
+    }
+
+    const scrollContainer =
+      this.getScrollContainer() || document.querySelector(this.getResponseContainerSelector())
+    if (!(scrollContainer instanceof HTMLElement)) {
+      return null
+    }
+
+    const messages = await this.collectExportMessageSnapshots(scrollContainer, collector)
+    if (messages.length === 0) {
+      return null
+    }
+
+    if (collector) {
+      this.exportBundleCache = {
+        messages,
+        assets: collector.assets,
+      }
+    }
+
+    this.mountExportSnapshot(messages)
+    return { count: messages.length }
+  }
+
+  async extractExportBundle(_context: ExportLifecycleContext): Promise<ExportBundle | null> {
+    return this.exportBundleCache
+  }
+
+  async restoreConversationAfterExport(
+    _context: ExportLifecycleContext,
+    _state: unknown,
+  ): Promise<void> {
+    this.clearExportSnapshot()
+    this.exportIncludeThoughtsOverride = null
+    this.exportBundleCache = null
+  }
+
+  getLatestReplyText(): string | null {
+    const prevOverride = this.exportIncludeThoughtsOverride
+    this.exportIncludeThoughtsOverride = false
+
+    const scrollContainer =
+      this.getScrollContainer() || document.querySelector(this.getResponseContainerSelector())
+    try {
+      if (scrollContainer instanceof HTMLElement) {
+        const originalScrollTop = scrollContainer.scrollTop
+        const maxScroll = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+
+        try {
+          scrollContainer.scrollTop = maxScroll
+          scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+          scrollContainer.getBoundingClientRect()
+
+          const latest = this.extractLatestReplyTextFromMessages(
+            this.getVisibleAssistantMessages(scrollContainer),
+          )
+          if (latest) {
+            return latest
+          }
+        } finally {
+          scrollContainer.scrollTop = originalScrollTop
+          scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+        }
+      }
+
+      return this.extractLatestReplyTextFromMessages(this.getVisibleAssistantMessages(document))
+    } finally {
+      this.exportIncludeThoughtsOverride = prevOverride
+    }
+  }
+
+  getLastCodeBlockText(): string | null {
+    const prevOverride = this.exportIncludeThoughtsOverride
+    this.exportIncludeThoughtsOverride = false
+
+    const scrollContainer =
+      this.getScrollContainer() || document.querySelector(this.getResponseContainerSelector())
+    try {
+      if (scrollContainer instanceof HTMLElement) {
+        const positions = this.buildBottomUpScanPositions(scrollContainer)
+        const originalScrollTop = scrollContainer.scrollTop
+
+        try {
+          for (const top of positions) {
+            scrollContainer.scrollTop = top
+            scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+            scrollContainer.getBoundingClientRect()
+
+            const code = this.extractLastCodeBlockTextFromMessages(
+              this.getVisibleAssistantMessages(scrollContainer),
+            )
+            if (code) {
+              return code
+            }
+          }
+        } finally {
+          scrollContainer.scrollTop = originalScrollTop
+          scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+        }
+      }
+
+      return this.extractLastCodeBlockTextFromMessages(this.getVisibleAssistantMessages(document))
+    } finally {
+      this.exportIncludeThoughtsOverride = prevOverride
+    }
+  }
+
+  getSubmitButtonSelectors(): string[] {
+    return [...this.config.selectors.submitButton]
+  }
+
+  findSubmitButton(editor: HTMLElement | null): HTMLElement | null {
+    const selector = this.getSubmitButtonSelectors().join(", ")
+    if (!selector) return null
+
+    const scopes = [
+      editor?.closest("form"),
+      editor?.parentElement,
+      editor?.closest("div"),
+      document.body,
+    ].filter(Boolean) as ParentNode[]
+
+    const seen = new Set<HTMLElement>()
+
+    for (const scope of scopes) {
+      const buttons = scope.querySelectorAll(selector)
+      for (const button of Array.from(buttons)) {
+        const element = button as HTMLElement
+        if (seen.has(element) || element.offsetParent === null) continue
+        seen.add(element)
+        return element
+      }
+    }
+
+    return null
+  }
+
+  getNewChatButtonSelectors(): string[] {
+    return [...this.config.selectors.newChatButton]
+  }
+
+  getWidthSelectors() {
+    return this.config.widthSelectors.map((selector) => ({ ...selector }))
+  }
+
+  getPanelAvoidanceConfig(): PanelAvoidanceConfig {
+    return {
+      scopeSelector: this.config.sitePrivateSelectors.panelAvoidanceScope,
+      widthSelectors: this.getWidthSelectors(),
+      insetSelectors: [
+        { selector: this.config.sitePrivateSelectors.messageListItems },
+        { selector: this.config.sitePrivateSelectors.messageComposer },
+        {
+          selector: this.config.sitePrivateSelectors.newChatLayoutScope,
+          scopeSelector: this.config.sitePrivateSelectors.newChatLayoutScope,
+          insetMode: "edge",
+          extraCss: "box-sizing: border-box !important; min-width: 0 !important;",
+        },
+        {
+          selector: this.config.sitePrivateSelectors.canvasPreviewSafeArea,
+          scopeSelector: this.config.sitePrivateSelectors.canvasLayoutScope,
+          applySide: "right",
+          insetMode: "edge",
+          extraCss: "box-sizing: border-box !important; min-width: 0 !important;",
+        },
+      ],
+      defaultWidth: "840px",
+      gap: 16,
+    }
+  }
+
+  getUserQueryWidthSelectors() {
+    const userQueryWidthCss = [
+      "max-width: 100% !important;",
+      "min-width: 0 !important;",
+      "box-sizing: border-box !important;",
+      "margin-left: auto !important;",
+      "margin-right: 0 !important;",
+      "overflow-wrap: anywhere !important;",
+      "word-break: break-word !important;",
+    ].join(" ")
+
+    return [
+      {
+        // 用户问题内容节点使用随机哈希类名，改为匹配 ds-message 下稳定的直接内容 div。
+        selector: this.config.sitePrivateSelectors.userMessageContent,
+        property: "width",
+        extraCss: userQueryWidthCss,
+        noCenter: true,
+      },
+    ]
+  }
+
+  isGenerating(): boolean {
+    const buttons = this.findComposerButtons()
+    const selector = this.config.generating.existsSelectors.join(", ")
+    if (!selector) return false
+
+    for (const button of buttons) {
+      if (button.matches(selector)) {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  getStopButtonSelectors(): string[] {
+    return [...this.config.selectors.stopButton]
+  }
+
+  getModelName(): string | null {
+    const selectedButtons = Array.from(
+      document.querySelectorAll(this.config.sitePrivateSelectors.selectedModel),
+    )
+      .map(
+        (button) => (button as HTMLElement).innerText?.trim() || button.textContent?.trim() || "",
+      )
+      .filter(Boolean)
+
+    if (selectedButtons.length === 0) {
+      return "DeepSeek"
+    }
+
+    return `DeepSeek (${selectedButtons.join(", ")})`
+  }
+
+  getNetworkMonitorConfig(): NetworkMonitorConfig {
+    return {
+      ...this.config.networkMonitor,
+      urlPatterns: [...this.config.networkMonitor.urlPatterns],
+      urlPathEndsWith: this.config.networkMonitor.urlPathEndsWith
+        ? [...this.config.networkMonitor.urlPathEndsWith]
+        : undefined,
+      requestBodyRules: this.config.networkMonitor.requestBodyRules?.map((rule) => ({
+        ...rule,
+        metadata: { ...rule.metadata },
+      })),
+    }
+  }
+
+  async toggleTheme(targetMode: "light" | "dark" | "system"): Promise<boolean> {
+    try {
+      const resolvedMode: "light" | "dark" =
+        targetMode === "system"
+          ? typeof window !== "undefined" &&
+            typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light"
+          : targetMode
+
+      const themeData = JSON.stringify({ value: targetMode, __version: "0" })
+      localStorage.setItem(THEME_STORAGE_KEY, themeData)
+
+      const body = document.body
+      if (body) {
+        body.classList.remove("light", "dark")
+        body.classList.add("change-theme", resolvedMode)
+
+        if (resolvedMode === "dark") {
+          body.setAttribute("data-ds-dark-theme", "dark")
+        } else {
+          body.removeAttribute("data-ds-dark-theme")
+        }
+
+        body.style.colorScheme = resolvedMode
+
+        window.setTimeout(() => {
+          if (document.body === body) {
+            body.classList.remove("change-theme")
+          }
+        }, 300)
+      }
+
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: THEME_STORAGE_KEY,
+          newValue: themeData,
+          storageArea: localStorage,
+        }),
+      )
+
+      return true
+    } catch (error) {
+      console.error("[DeepSeekAdapter] toggleTheme error:", error)
+      return false
+    }
+  }
+
+  private findComposerButtons(): HTMLElement[] {
+    const textarea = this.getTextareaElement()
+    const scopes = [
+      textarea?.closest("form"),
+      textarea?.parentElement,
+      textarea?.closest("div"),
+      document.body,
+    ].filter(Boolean) as HTMLElement[]
+
+    const seen = new Set<HTMLElement>()
+    const buttons: HTMLElement[] = []
+
+    for (const scope of scopes) {
+      const found = scope.querySelectorAll(this.config.sitePrivateSelectors.composerButton)
+      for (const button of Array.from(found)) {
+        const el = button as HTMLElement
+        if (el.offsetParent === null || seen.has(el)) continue
+        seen.add(el)
+        buttons.push(el)
+      }
+
+      if (buttons.length > 0) {
+        return buttons
+      }
+    }
+
+    return buttons
+  }
+
+  private pickBestScrollableAncestor(elements: Element[]): HTMLElement | null {
+    const scored = new Map<HTMLElement, number>()
+
+    for (const element of elements) {
+      const ancestor = this.findScrollableAncestor(element)
+      if (!ancestor) continue
+      const current = scored.get(ancestor) || 0
+      scored.set(ancestor, current + this.scoreScrollContainer(ancestor))
+    }
+
+    let best: HTMLElement | null = null
+    let bestScore = -1
+
+    for (const [candidate, score] of scored.entries()) {
+      if (score > bestScore) {
+        best = candidate
+        bestScore = score
+      }
+    }
+
+    return bestScore > 0 ? best : null
+  }
+
+  private findScrollableAncestor(element: Element | null): HTMLElement | null {
+    let current = element instanceof HTMLElement ? element : element?.parentElement || null
+
+    while (current && current !== document.body) {
+      if (this.isPrimaryScrollContainer(current)) {
+        return current
+      }
+      current = current.parentElement
+    }
+
+    return null
+  }
+
+  private isPrimaryScrollContainer(element: HTMLElement): boolean {
+    if (!element.isConnected) return false
+
+    const style = window.getComputedStyle(element)
+    if (!(style.overflowY === "auto" || style.overflowY === "scroll")) {
+      return false
+    }
+
+    if (element.scrollHeight <= element.clientHeight) {
+      return false
+    }
+
+    if (element.clientHeight < 220) {
+      return false
+    }
+
+    const rect = element.getBoundingClientRect()
+    if (rect.width < 320 || rect.height < 220) {
+      return false
+    }
+
+    return true
+  }
+
+  private scoreScrollContainer(element: HTMLElement): number {
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0
+    const rect = element.getBoundingClientRect()
+    const messageCount = element.querySelectorAll(this.config.sitePrivateSelectors.message).length
+    const userCount = element.querySelectorAll(this.config.selectors.userQuery).length
+    const assistantCount = element.querySelectorAll(this.config.selectors.assistantResponse).length
+
+    let score = 0
+
+    score += Math.min(messageCount, 80) * 200
+    score += Math.min(userCount, 40) * 120
+    score += Math.min(assistantCount, 40) * 120
+
+    if (element.scrollTop > 0) {
+      score += 800
+    }
+
+    if (rect.height >= viewportHeight * 0.35) {
+      score += 500
+    }
+
+    if (rect.width >= viewportWidth * 0.45) {
+      score += 350
+    }
+
+    if (
+      element.matches(this.config.sitePrivateSelectors.mainRegion) ||
+      element.closest(this.config.sitePrivateSelectors.mainRegion)
+    ) {
+      score += 250
+    }
+
+    if (element.querySelector("textarea")) {
+      score -= 700
+    }
+
+    if (element.querySelector(".gh-table-container")) {
+      score -= 250
+    }
+
+    return score
+  }
+
+  private extractNativeUserQueries(domUserQueries: OutlineItem[]): OutlineItem[] {
+    const nativeEntries = this.collectNativeOutlineEntries()
+    if (nativeEntries.length === 0) {
+      return []
+    }
+
+    const outline: OutlineItem[] = []
+    const occurrenceMap = new Map<string, number>()
+    let domQueryCursor = 0
+
+    nativeEntries.forEach((entry) => {
+      const matchIndex = this.findMatchingUserQueryIndex(domUserQueries, entry.text, domQueryCursor)
+      const matchedQuery = matchIndex >= 0 ? domUserQueries[matchIndex] : null
+
+      if (matchIndex >= 0) {
+        domQueryCursor = matchIndex + 1
+      }
+
+      const item = this.createUserQueryOutlineItem(entry.text, matchedQuery?.element || null)
+      item.wordCount = matchedQuery?.wordCount
+
+      const occurrenceKey = this.normalizeUserQueryMatchText(entry.text)
+      const occurrence = occurrenceMap.get(occurrenceKey) || 0
+      occurrenceMap.set(occurrenceKey, occurrence + 1)
+
+      item.id =
+        matchedQuery?.id ||
+        `deepseek-user-query::${occurrence}::${this.normalizeUserQueryMatchText(entry.text)}`
+
+      outline.push(item)
+    })
+
+    return outline
+  }
+
+  private mergeOutlineWithNativeUserQueries(
+    domOutline: OutlineItem[],
+    nativeUserQueries: OutlineItem[],
+  ): OutlineItem[] {
+    if (!domOutline.some((item) => item.isUserQuery)) {
+      return [...nativeUserQueries, ...domOutline]
+    }
+
+    type QuerySegment =
+      | {
+          type: "matched"
+          nativeIndex: number
+          assistantItems: OutlineItem[]
+        }
+      | {
+          type: "unmatched"
+          userItem: OutlineItem
+          assistantItems: OutlineItem[]
+        }
+
+    const leadingAssistantItems: OutlineItem[] = []
+    const segments: QuerySegment[] = []
+    let currentSegment: QuerySegment | null = null
+    let nativeQueryCursor = 0
+
+    domOutline.forEach((item) => {
+      if (!item.isUserQuery) {
+        if (currentSegment) {
+          currentSegment.assistantItems.push(item)
+        } else {
+          leadingAssistantItems.push(item)
+        }
+        return
+      }
+
+      const matchIndex = this.findMatchingNativeUserQueryIndex(
+        nativeUserQueries,
+        item,
+        nativeQueryCursor,
+      )
+
+      if (matchIndex >= 0) {
+        currentSegment = {
+          type: "matched",
+          nativeIndex: matchIndex,
+          assistantItems: [],
+        }
+        nativeQueryCursor = matchIndex + 1
+      } else {
+        currentSegment = {
+          type: "unmatched",
+          userItem: item,
+          assistantItems: [],
+        }
+      }
+
+      segments.push(currentSegment)
+    })
+
+    const firstMatchedSegment = segments.find(
+      (segment): segment is Extract<QuerySegment, { type: "matched" }> =>
+        segment.type === "matched",
+    )
+    if (!firstMatchedSegment) {
+      return [...nativeUserQueries, ...domOutline]
+    }
+
+    const merged: OutlineItem[] = []
+    let nextNativeQueryIndex = 0
+
+    if (leadingAssistantItems.length > 0) {
+      // DeepSeek 虚拟滚动可能会让当前可见 assistant 回复先挂在 DOM 中，
+      // 而对应的上一条用户提问暂时被卸载。此时把这些 heading 归到
+      // “首个可见用户提问之前的最后一条原生提问”后面，可以避免回答跑到提问上方。
+      const leadingTargetIndex = Math.max(firstMatchedSegment.nativeIndex - 1, 0)
+
+      while (
+        nextNativeQueryIndex <= leadingTargetIndex &&
+        nextNativeQueryIndex < nativeUserQueries.length
+      ) {
+        merged.push(nativeUserQueries[nextNativeQueryIndex])
+        nextNativeQueryIndex += 1
+      }
+
+      merged.push(...leadingAssistantItems)
+    }
+
+    segments.forEach((segment) => {
+      if (segment.type === "matched") {
+        while (
+          nextNativeQueryIndex <= segment.nativeIndex &&
+          nextNativeQueryIndex < nativeUserQueries.length
+        ) {
+          merged.push(nativeUserQueries[nextNativeQueryIndex])
+          nextNativeQueryIndex += 1
+        }
+
+        merged.push(...segment.assistantItems)
+        return
+      }
+
+      merged.push(segment.userItem, ...segment.assistantItems)
+    })
+
+    while (nextNativeQueryIndex < nativeUserQueries.length) {
+      merged.push(nativeUserQueries[nextNativeQueryIndex])
+      nextNativeQueryIndex += 1
+    }
+
+    return merged
+  }
+
+  private collectNativeOutlineEntries(): DeepSeekNativeOutlineEntry[] {
+    const sessionId = this.getSessionId()
+    const list = this.findNativeOutlineList()
+
+    if (!list) {
+      return this.nativeOutlineCache?.sessionId === sessionId
+        ? this.nativeOutlineCache.items.map((item) => ({ ...item }))
+        : []
+    }
+
+    const scrollContainer = this.findNativeOutlineScrollContainer(list)
+    const snapshot = this.getNativeOutlineSnapshot(sessionId, list, scrollContainer)
+
+    if (
+      this.nativeOutlineCache &&
+      this.nativeOutlineCache.sessionId === sessionId &&
+      this.nativeOutlineCache.snapshot === snapshot
+    ) {
+      return this.nativeOutlineCache.items.map((item) => ({ ...item }))
+    }
+
+    const scanned = this.scanNativeOutlineEntries(list, scrollContainer)
+    if (scanned.length > 0) {
+      this.nativeOutlineCache = {
+        sessionId,
+        snapshot,
+        items: scanned.map((item) => ({ ...item })),
+      }
+    }
+
+    return scanned
+  }
+
+  private findNativeOutlineList(): HTMLElement | null {
+    const candidates = Array.from(
+      document.querySelectorAll(this.config.sitePrivateSelectors.nativeOutlineList),
+    ).filter(
+      (candidate) =>
+        candidate instanceof HTMLElement &&
+        candidate.querySelector(this.config.sitePrivateSelectors.nativeOutlineContentRoots) &&
+        !candidate.querySelector(this.config.conversation.itemSelector) &&
+        !candidate.closest(this.config.sitePrivateSelectors.nativeOutlineExcludedAncestor),
+    ) as HTMLElement[]
+
+    let best: HTMLElement | null = null
+    let bestScore = -1
+
+    candidates.forEach((candidate) => {
+      const rect = candidate.getBoundingClientRect()
+      let score = 0
+
+      if (candidate.closest(this.config.sitePrivateSelectors.nativeOutlinePaddingScope)) {
+        score += 2500
+      }
+
+      if (candidate.closest(this.config.sitePrivateSelectors.mainRegion)) {
+        score += 600
+      }
+
+      if (candidate.querySelector(this.config.sitePrivateSelectors.nativeOutlineVisibleItems)) {
+        score += 400
+      }
+
+      if (rect.width >= 140 && rect.width <= 420) {
+        score += 350
+      }
+
+      if (rect.height >= 120) {
+        score += 250
+      }
+
+      if (candidate.scrollHeight > candidate.clientHeight + 20) {
+        score += 300
+      }
+
+      if (candidate.querySelector(this.config.sitePrivateSelectors.message)) {
+        score -= 1500
+      }
+
+      if (score > bestScore) {
+        best = candidate
+        bestScore = score
+      }
+    })
+
+    return bestScore > 0 ? best : null
+  }
+
+  private findNativeOutlineScrollContainer(list: HTMLElement): HTMLElement | null {
+    const candidates = [
+      list,
+      list.closest(this.config.sitePrivateSelectors.sidebarScrollArea),
+      list.parentElement,
+      list
+        .closest(this.config.sitePrivateSelectors.nativeOutlinePaddingScope)
+        ?.querySelector(this.config.sitePrivateSelectors.sidebarScrollArea),
+    ].filter((candidate): candidate is HTMLElement => candidate instanceof HTMLElement)
+
+    let best: HTMLElement | null = null
+    let bestScore = -1
+
+    candidates.forEach((candidate) => {
+      const style = window.getComputedStyle(candidate)
+      const canScroll =
+        candidate.scrollHeight > candidate.clientHeight + 8 ||
+        style.overflowY === "auto" ||
+        style.overflowY === "scroll" ||
+        candidate.matches(this.config.sitePrivateSelectors.nativeOutlineList) ||
+        candidate.matches(this.config.sitePrivateSelectors.sidebarScrollArea)
+
+      if (!canScroll || candidate.clientHeight <= 0) {
+        return
+      }
+
+      let score = 0
+      if (candidate === list) score += 500
+      if (candidate.matches(this.config.sitePrivateSelectors.nativeOutlineList)) score += 350
+      if (candidate.matches(this.config.sitePrivateSelectors.sidebarScrollArea)) score += 250
+      score += Math.min(candidate.scrollHeight - candidate.clientHeight, 2000)
+
+      if (score > bestScore) {
+        best = candidate
+        bestScore = score
+      }
+    })
+
+    return bestScore > 0 ? best : null
+  }
+
+  private getNativeOutlineSnapshot(
+    sessionId: string,
+    list: HTMLElement,
+    scrollContainer: HTMLElement | null,
+  ): string {
+    const itemsRoot = list.querySelector(
+      this.config.sitePrivateSelectors.nativeOutlineItems,
+    ) as HTMLElement | null
+    const visibleRoot = list.querySelector(
+      this.config.sitePrivateSelectors.nativeOutlineVisibleItems,
+    )
+    const scrollHost = scrollContainer || list
+
+    return [
+      sessionId,
+      scrollHost.scrollHeight,
+      scrollHost.clientHeight,
+      itemsRoot?.scrollHeight || 0,
+      visibleRoot?.childElementCount || 0,
+    ].join("::")
+  }
+
+  private scanNativeOutlineEntries(
+    list: HTMLElement,
+    scrollContainer: HTMLElement | null,
+  ): DeepSeekNativeOutlineEntry[] {
+    const visibleOnly = this.readVisibleNativeOutlineEntries(list)
+    if (!scrollContainer) {
+      return visibleOnly
+    }
+
+    const maxScroll = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+    if (maxScroll <= 0) {
+      return visibleOnly
+    }
+
+    const originalScrollTop = scrollContainer.scrollTop
+    const step = Math.max(48, Math.floor(scrollContainer.clientHeight * 0.6))
+    const positions = new Set<number>([0, maxScroll, originalScrollTop])
+
+    for (let top = 0; top < maxScroll; top += step) {
+      positions.add(top)
+    }
+
+    let collected: DeepSeekNativeOutlineEntry[] = []
+
+    try {
+      Array.from(positions)
+        .sort((a, b) => a - b)
+        .forEach((top) => {
+          scrollContainer.scrollTop = top
+          scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+
+          // 强制浏览器同步 layout，确保虚拟列表完成本轮渲染。
+          scrollContainer.getBoundingClientRect()
+          list.getBoundingClientRect()
+
+          const batch = this.readVisibleNativeOutlineEntries(list)
+          collected = this.mergeNativeOutlineEntryBatch(collected, batch, top)
+        })
+    } finally {
+      scrollContainer.scrollTop = originalScrollTop
+      scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+    }
+
+    return collected
+  }
+
+  private readVisibleNativeOutlineEntries(list: HTMLElement): DeepSeekNativeOutlineEntry[] {
+    const visibleRoot =
+      (list.querySelector(
+        this.config.sitePrivateSelectors.nativeOutlineVisibleItems,
+      ) as HTMLElement | null) ||
+      (list.querySelector(
+        this.config.sitePrivateSelectors.nativeOutlineItems,
+      ) as HTMLElement | null)
+    if (!visibleRoot) {
+      return []
+    }
+
+    const entries: DeepSeekNativeOutlineEntry[] = []
+
+    Array.from(visibleRoot.children).forEach((child, index) => {
+      if (!(child instanceof HTMLElement)) return
+
+      const text = this.extractNativeOutlineText(child)
+      if (!text) return
+
+      entries.push({ text, batchIndex: index })
+    })
+
+    return entries
+  }
+
+  private extractNativeOutlineText(item: HTMLElement): string {
+    const directChildren = Array.from(item.children).filter(
+      (child): child is HTMLElement => child instanceof HTMLElement,
+    )
+
+    for (const child of directChildren) {
+      const text = this.normalizeOutlineText(child.innerText || child.textContent || "")
+      if (text) {
+        return text
+      }
+    }
+
+    return this.normalizeOutlineText(item.innerText || item.textContent || "")
+  }
+
+  private mergeNativeOutlineEntryBatch(
+    collected: DeepSeekNativeOutlineEntry[],
+    batch: DeepSeekNativeOutlineEntry[],
+    scrollTop: number,
+  ): DeepSeekNativeOutlineEntry[] {
+    if (batch.length === 0) {
+      return collected
+    }
+
+    if (collected.length === 0) {
+      return batch.map((item) => ({
+        ...item,
+        scrollTop: item.scrollTop ?? scrollTop,
+      }))
+    }
+
+    const maxOverlap = Math.min(collected.length, batch.length)
+    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+      const collectedTail = collected.slice(-overlap)
+      const batchHead = batch.slice(0, overlap)
+      if (this.nativeOutlineEntrySequenceEquals(collectedTail, batchHead)) {
+        return [
+          ...collected,
+          ...batch.slice(overlap).map((item) => ({
+            ...item,
+            scrollTop: item.scrollTop ?? scrollTop,
+          })),
+        ]
+      }
+    }
+
+    return [
+      ...collected,
+      ...batch.map((item) => ({
+        ...item,
+        scrollTop: item.scrollTop ?? scrollTop,
+      })),
+    ]
+  }
+
+  private nativeOutlineEntrySequenceEquals(
+    left: DeepSeekNativeOutlineEntry[],
+    right: DeepSeekNativeOutlineEntry[],
+  ): boolean {
+    if (left.length !== right.length) {
+      return false
+    }
+
+    return left.every((item, index) => this.nativeOutlineEntryEquals(item, right[index]))
+  }
+
+  private nativeOutlineEntryEquals(
+    left: DeepSeekNativeOutlineEntry,
+    right: DeepSeekNativeOutlineEntry,
+  ): boolean {
+    return (
+      this.normalizeUserQueryMatchText(left.text) === this.normalizeUserQueryMatchText(right.text)
+    )
+  }
+
+  private findMatchingUserQueryIndex(
+    queries: OutlineItem[],
+    text: string,
+    startIndex: number,
+  ): number {
+    for (let i = startIndex; i < queries.length; i += 1) {
+      if (this.isEquivalentUserQueryText(queries[i].text, text)) {
+        return i
+      }
+    }
+
+    return -1
+  }
+
+  private findMatchingNativeUserQueryIndex(
+    nativeQueries: OutlineItem[],
+    query: OutlineItem,
+    startIndex: number,
+  ): number {
+    for (let i = startIndex; i < nativeQueries.length; i += 1) {
+      if (this.isEquivalentUserQueryText(nativeQueries[i].text, query.text)) {
+        return i
+      }
+    }
+
+    return -1
+  }
+
+  private isEquivalentUserQueryText(left: string, right: string): boolean {
+    const normalizedLeft = this.normalizeUserQueryMatchText(left)
+    const normalizedRight = this.normalizeUserQueryMatchText(right)
+
+    if (!normalizedLeft || !normalizedRight) {
+      return false
+    }
+
+    return (
+      normalizedLeft === normalizedRight ||
+      normalizedLeft.startsWith(normalizedRight) ||
+      normalizedRight.startsWith(normalizedLeft)
+    )
+  }
+
+  private normalizeUserQueryMatchText(text: string): string {
+    return this.normalizeOutlineText(text).replace(/(?:\.{3}|…)$/u, "")
+  }
+
+  private normalizeOutlineText(text: string): string {
+    return text.replace(/\s+/g, " ").trim()
+  }
+
+  private async revealUserQueryThroughNativeOutline(
+    queryIndex: number,
+    text: string,
+    requestId: number,
+  ): Promise<boolean> {
+    const list = this.findNativeOutlineList()
+    if (!list) {
+      return false
+    }
+
+    const scrollContainer = this.findNativeOutlineScrollContainer(list)
+    if (!scrollContainer) {
+      return false
+    }
+
+    const entries = this.collectNativeOutlineEntries()
+    if (entries.length === 0) {
+      return false
+    }
+
+    const targetEntry = this.resolveNativeOutlineEntry(entries, queryIndex, text)
+    if (!targetEntry) {
+      return false
+    }
+
+    const candidateScrollTops = this.buildNativeOutlineJumpPositions(
+      entries,
+      targetEntry,
+      queryIndex,
+      scrollContainer,
+      text,
+    )
+
+    for (const top of candidateScrollTops) {
+      if (requestId !== this.nativeOutlineRevealRequestId) {
+        return false
+      }
+
+      scrollContainer.scrollTop = top
+      scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+      await this.sleep(NATIVE_OUTLINE_SETTLE_MS)
+
+      if (requestId !== this.nativeOutlineRevealRequestId) {
+        return false
+      }
+
+      const targetItem = this.findVisibleNativeOutlineItem(list, targetEntry, text)
+      if (!targetItem) {
+        continue
+      }
+
+      this.dispatchNativeOutlineClick(targetItem)
+      return true
+    }
+
+    return false
+  }
+
+  private resolveNativeOutlineEntry(
+    entries: DeepSeekNativeOutlineEntry[],
+    queryIndex: number,
+    text: string,
+  ): DeepSeekNativeOutlineEntry | null {
+    if (queryIndex > 0 && queryIndex <= entries.length) {
+      return entries[queryIndex - 1]
+    }
+
+    return entries.find((entry) => this.isEquivalentUserQueryText(entry.text, text)) || null
+  }
+
+  private buildNativeOutlineJumpPositions(
+    entries: DeepSeekNativeOutlineEntry[],
+    targetEntry: DeepSeekNativeOutlineEntry,
+    queryIndex: number,
+    scrollContainer: HTMLElement,
+    text: string,
+  ): number[] {
+    const maxScroll = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+    const estimatedTop =
+      entries.length > 1
+        ? Math.round((maxScroll * Math.max(queryIndex - 1, 0)) / Math.max(entries.length - 1, 1))
+        : 0
+
+    const matchTops = entries
+      .filter((entry) => this.isEquivalentUserQueryText(entry.text, text))
+      .map((entry) => entry.scrollTop)
+      .filter((top): top is number => typeof top === "number")
+
+    const positions = [
+      targetEntry.scrollTop,
+      estimatedTop,
+      estimatedTop - scrollContainer.clientHeight * 0.5,
+      estimatedTop + scrollContainer.clientHeight * 0.5,
+      ...matchTops,
+      0,
+      maxScroll,
+    ]
+
+    const seen = new Set<number>()
+
+    return positions
+      .map((top) => Math.max(0, Math.min(maxScroll, Math.round(top || 0))))
+      .filter((top) => {
+        if (seen.has(top)) {
+          return false
+        }
+        seen.add(top)
+        return true
+      })
+  }
+
+  private findVisibleNativeOutlineItem(
+    list: HTMLElement,
+    targetEntry: DeepSeekNativeOutlineEntry,
+    text: string,
+  ): HTMLElement | null {
+    const visibleRoot =
+      (list.querySelector(
+        this.config.sitePrivateSelectors.nativeOutlineVisibleItems,
+      ) as HTMLElement | null) ||
+      (list.querySelector(
+        this.config.sitePrivateSelectors.nativeOutlineItems,
+      ) as HTMLElement | null)
+    if (!visibleRoot) {
+      return null
+    }
+
+    const children = Array.from(visibleRoot.children).filter(
+      (child): child is HTMLElement => child instanceof HTMLElement,
+    )
+
+    if (
+      typeof targetEntry.batchIndex === "number" &&
+      targetEntry.batchIndex >= 0 &&
+      targetEntry.batchIndex < children.length
+    ) {
+      const indexedChild = children[targetEntry.batchIndex]
+      if (this.isEquivalentUserQueryText(this.extractNativeOutlineText(indexedChild), text)) {
+        return indexedChild
+      }
+    }
+
+    return (
+      children.find((child) =>
+        this.isEquivalentUserQueryText(this.extractNativeOutlineText(child), text),
+      ) || null
+    )
+  }
+
+  private dispatchNativeOutlineClick(element: HTMLElement): void {
+    const target =
+      (element.querySelector('button, [role="button"], a') as HTMLElement | null) || element
+
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }))
+    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }))
+    target.click()
+  }
+
+  private async waitForUserQueryElement(
+    queryIndex: number,
+    text: string,
+    requestId: number,
+  ): Promise<Element | null> {
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < USER_QUERY_REVEAL_TIMEOUT_MS) {
+      if (requestId !== this.nativeOutlineRevealRequestId) {
+        return null
+      }
+
+      const found = this.findUserQueryElement(queryIndex, text)
+      if (found) {
+        return found
+      }
+
+      await this.sleep(USER_QUERY_REVEAL_INTERVAL_MS)
+    }
+
+    if (requestId !== this.nativeOutlineRevealRequestId) {
+      return null
+    }
+
+    return this.findUserQueryElement(queryIndex, text)
+  }
+
+  private getVisibleUserQueryElements(): Element[] {
+    const messageSelector = this.config.sitePrivateSelectors.message
+    return Array.from(document.querySelectorAll(this.config.selectors.userQuery)).filter(
+      (element) =>
+        element instanceof HTMLElement && !element.parentElement?.closest(messageSelector),
+    )
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms))
+  }
+
+  private isExportSnapshotElement(element: Element): boolean {
+    return element.hasAttribute(DEEPSEEK_EXPORT_ROLE_ATTR)
+  }
+
+  private async collectShareExportMessageSnapshots(
+    collector?: ExportAssetCollector,
+  ): Promise<DeepSeekExportMessageSnapshot[] | null> {
+    if (!this.isSharePage()) {
+      return null
+    }
+
+    const shareId = this.getSessionId()
+    if (!shareId) {
+      return null
+    }
+
+    try {
+      const response = await fetch(
+        `/api/v0/share/content?share_id=${encodeURIComponent(shareId)}`,
+        {
+          credentials: "include",
+        },
+      )
+      if (!response.ok) {
+        return null
+      }
+
+      const payload = await response.json()
+      const messages = this.extractShareExportMessagesFromPayload(payload, collector)
+      return messages.length > 0 ? messages : null
+    } catch (error) {
+      console.warn("[DeepSeekAdapter] Failed to collect share export payload:", error)
+      return null
+    }
+  }
+
+  private extractShareExportMessagesFromPayload(
+    payload: unknown,
+    collector?: ExportAssetCollector,
+  ): DeepSeekExportMessageSnapshot[] {
+    const bizData = this.getNestedRecord(payload, ["data", "biz_data"])
+    const rawMessages = bizData?.messages
+    if (!Array.isArray(rawMessages)) {
+      return []
+    }
+
+    const messages: DeepSeekExportMessageSnapshot[] = []
+
+    rawMessages.forEach((rawMessage) => {
+      const message = this.toRecord(rawMessage)
+      if (!message) return
+
+      const role = typeof message.role === "string" ? message.role.toUpperCase() : ""
+      const fragments = Array.isArray(message.fragments) ? message.fragments : []
+      if (role === "USER") {
+        const attachments: DeepSeekUserAttachment[] = []
+        const requestParts: string[] = []
+
+        fragments.forEach((rawFragment) => {
+          const fragment = this.toRecord(rawFragment)
+          if (!fragment) return
+
+          const type = typeof fragment.type === "string" ? fragment.type.toUpperCase() : ""
+          if (type === "FILE") {
+            attachments.push(...this.extractShareUserAttachments(fragment))
+            return
+          }
+
+          if (type === "REQUEST" && typeof fragment.content === "string") {
+            requestParts.push(fragment.content)
+          }
+        })
+
+        const content = this.normalizeExportMessageContent(
+          this.formatUserQueryExportContent(requestParts.join("\n\n"), attachments, collector),
+        )
+        if (content) {
+          messages.push({ role: DEEPSEEK_EXPORT_ROLE_USER, content })
+        }
+        return
+      }
+
+      if (role === "ASSISTANT") {
+        const responseParts: string[] = []
+        const thoughtParts: string[] = []
+
+        fragments.forEach((rawFragment) => {
+          const fragment = this.toRecord(rawFragment)
+          if (!fragment || typeof fragment.content !== "string") return
+
+          const type = typeof fragment.type === "string" ? fragment.type.toUpperCase() : ""
+          if (type === "THINK") {
+            thoughtParts.push(fragment.content)
+          } else if (type === "RESPONSE") {
+            responseParts.push(fragment.content)
+          }
+        })
+
+        const cleanThought = thoughtParts
+          .map((content) => content.trim())
+          .filter(Boolean)
+          .join("\n\n")
+
+        const thoughtBlocks =
+          this.shouldIncludeThoughtsInExport() && cleanThought
+            ? [this.formatAsThoughtBlockquote(cleanThought)]
+            : []
+        const content = this.normalizeExportMessageContent(
+          [...thoughtBlocks, ...responseParts.map((content) => content.trim()).filter(Boolean)]
+            .filter(Boolean)
+            .join("\n\n"),
+        )
+        if (content) {
+          messages.push({ role: DEEPSEEK_EXPORT_ROLE_ASSISTANT, content })
+        }
+      }
+    })
+
+    return messages
+  }
+
+  private extractShareUserAttachments(fragment: Record<string, unknown>): DeepSeekUserAttachment[] {
+    const files = Array.isArray(fragment.files) ? fragment.files : []
+
+    return files.flatMap((rawFile) => {
+      const file = this.toRecord(rawFile)
+      if (!file) return []
+
+      const name = typeof file.file_name === "string" ? file.file_name.trim() : ""
+      if (!name) return []
+
+      const signedPath = typeof file.signed_path === "string" ? file.signed_path.trim() : ""
+      const size = typeof file.file_size === "number" ? this.formatFileSize(file.file_size) : ""
+      const isImage = file.is_image === true
+
+      return [
+        {
+          kind: isImage ? "image" : "file",
+          name,
+          type: this.extractFileTypeFromName(name),
+          size,
+          source: signedPath ? normalizeExportAssetUrl(signedPath) : "",
+        },
+      ]
+    })
+  }
+
+  private getNestedRecord(source: unknown, path: string[]): Record<string, unknown> | null {
+    let current = this.toRecord(source)
+    for (const key of path) {
+      if (!current) return null
+      current = this.toRecord(current[key])
+    }
+    return current
+  }
+
+  private toRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : null
+  }
+
+  private extractDeepSeekUserQueryExportContent(
+    element: Element,
+    collector?: ExportAssetCollector,
+  ): string {
+    if (this.isExportSnapshotElement(element)) {
+      return element.textContent?.trim() || ""
+    }
+
+    const attachments = this.extractDomUserAttachments(element)
+    const body = this.extractUserQueryText(element)
+    return this.formatUserQueryExportContent(body, attachments, collector)
+  }
+
+  private resolveUserMessageElement(element: Element): HTMLElement | null {
+    if (element.matches(this.config.selectors.userQuery)) {
+      return element as HTMLElement
+    }
+
+    const message = element.closest(this.config.selectors.userQuery)
+    return message instanceof HTMLElement ? message : null
+  }
+
+  private extractDomUserAttachments(element: Element): DeepSeekUserAttachment[] {
+    const message = this.resolveUserMessageElement(element)
+    if (!message) {
+      return []
+    }
+
+    const attachments: DeepSeekUserAttachment[] = []
+    const seen = new Set<string>()
+
+    this.extractDomUserImageAttachments(message).forEach((attachment) => {
+      const key = `image:${attachment.source || attachment.name}`
+      if (seen.has(key)) return
+      seen.add(key)
+      attachments.push(attachment)
+    })
+
+    this.extractDomUserFileAttachments(message).forEach((attachment) => {
+      const key = `file:${attachment.source || attachment.name}:${attachment.type}:${attachment.size}`
+      if (seen.has(key)) return
+      seen.add(key)
+      attachments.push(attachment)
+    })
+
+    return attachments
+  }
+
+  private extractDomUserImageAttachments(message: Element): DeepSeekUserAttachment[] {
+    const images = Array.from(message.querySelectorAll("img")).filter(
+      (node): node is HTMLImageElement =>
+        node instanceof HTMLImageElement && !node.closest(".gh-user-query-markdown"),
+    )
+
+    return images.flatMap((image) => {
+      const source = this.getDeepSeekImageExportSource(image)
+      if (!source) return []
+
+      const name = this.extractImageAttachmentName(image, source)
+      return [
+        {
+          kind: "image",
+          name,
+          type: this.extractFileTypeFromName(name) || "image",
+          size: "",
+          source,
+        },
+      ]
+    })
+  }
+
+  private extractDomUserFileAttachments(message: Element): DeepSeekUserAttachment[] {
+    const cards = Array.from(message.querySelectorAll("div")).filter((node) =>
+      this.isLikelyUserFileAttachmentCard(node, message),
+    )
+
+    return cards.flatMap((card) => {
+      const name = this.extractAttachmentCardName(card)
+      if (!name) return []
+
+      const source = this.extractAttachmentCardSource(card)
+      const type = this.extractAttachmentCardType(card, name) || this.extractFileTypeFromName(name)
+      const kind = this.isImageAttachmentName(name, type) ? "image" : "file"
+
+      return [
+        {
+          kind,
+          name,
+          type,
+          size: this.extractAttachmentCardSize(card),
+          source,
+        },
+      ]
+    })
+  }
+
+  private formatUserQueryExportContent(
+    body: string,
+    attachments: DeepSeekUserAttachment[],
+    collector?: ExportAssetCollector,
+  ): string {
+    const cleanBody = this.stripUserAttachmentBodyText(body, attachments)
+    if (attachments.length === 0) {
+      return cleanBody
+    }
+
+    const imageMarkdown = this.formatUserImageAttachments(attachments, collector)
+    const fileMarkdown = this.formatUserFileAttachments(attachments, collector)
+    const fileBlock =
+      fileMarkdown.length > 0 ? `${t("exportAttachmentsLabel")}:\n${fileMarkdown.join("\n")}` : ""
+
+    return [imageMarkdown.join("\n\n"), fileBlock, cleanBody].filter(Boolean).join("\n\n")
+  }
+
+  private formatUserImageAttachments(
+    attachments: DeepSeekUserAttachment[],
+    collector?: ExportAssetCollector,
+  ): string[] {
+    return formatExportImageAttachments(attachments, collector, { siteId: this.getSiteId() })
+  }
+
+  private formatUserFileAttachments(
+    attachments: DeepSeekUserAttachment[],
+    collector?: ExportAssetCollector,
+  ): string[] {
+    return formatExportFileAttachments(attachments, collector, {
+      siteId: this.getSiteId(),
+      includeAttachment: (attachment) => attachment.kind !== "image" || !attachment.source,
+      getLabel: (attachment) => this.formatAttachmentLabel(attachment),
+    })
+  }
+
+  private formatAttachmentLabel(attachment: DeepSeekUserAttachment): string {
+    const details = this.formatAttachmentDetails(attachment)
+    return details ? `${attachment.name} (${details})` : attachment.name
+  }
+
+  private formatAttachmentDetails(attachment: DeepSeekUserAttachment): string {
+    return [
+      attachment.type && !this.fileNameEndsWithExtension(attachment.name, attachment.type)
+        ? attachment.type
+        : "",
+      attachment.size,
+    ]
+      .filter(Boolean)
+      .join(", ")
+  }
+
+  private getDeepSeekImageExportSource(image: HTMLImageElement): string {
+    const candidates = [image.currentSrc || "", image.src || "", image.getAttribute("src") || ""]
+
+    for (const candidate of candidates) {
+      const source = normalizeExportAssetUrl(candidate)
+      if (!source) continue
+      if (source.startsWith("data:image/svg+xml")) continue
+      if (isDownloadableExportAssetUrl(source)) return source
+    }
+
+    return ""
+  }
+
+  private extractImageAttachmentName(image: HTMLImageElement, source: string): string {
+    const candidates = [
+      image.alt || "",
+      image.getAttribute("title") || "",
+      image.getAttribute("aria-label") || "",
+      this.extractFilenameFromUrl(source),
+      "uploaded image",
+    ]
+
+    return candidates.map((value) => this.normalizeAttachmentText(value)).find(Boolean) || "image"
+  }
+
+  private isLikelyUserFileAttachmentCard(card: Element, message: Element): boolean {
+    if (card === message) return false
+    if (card.closest(".gh-user-query-markdown")) return false
+    if (!this.isWithinUserAttachmentContainer(card, message)) return false
+    if (!card.querySelector("svg") || card.querySelector("img")) return false
+
+    const name = this.extractAttachmentCardName(card)
+    if (!name) return false
+
+    const text = this.normalizeAttachmentText(card.textContent || "")
+    return text !== name
+  }
+
+  private isWithinUserAttachmentContainer(card: Element, message: Element): boolean {
+    let current: Element | null = card
+    while (current && current !== message) {
+      if (current.parentElement === message) {
+        return this.isLikelyUserAttachmentContainer(current)
+      }
+      current = current.parentElement
+    }
+    return false
+  }
+
+  private isLikelyUserAttachmentContainer(element: Element): boolean {
+    if (element.matches(".gh-inline-bookmark, .gh-user-query-raw, .gh-user-query-markdown")) {
+      return false
+    }
+    if (
+      element.matches(
+        `button, [role=button], ${this.config.sitePrivateSelectors.iconButton}, ${this.config.sitePrivateSelectors.focusRing}`,
+      )
+    ) {
+      return false
+    }
+    if (element.querySelector("img")) return true
+
+    const text = this.normalizeAttachmentText(element.textContent || "")
+    if (!text) return false
+    if (!element.querySelector("svg")) return false
+    return this.extractAttachmentCardName(element) !== ""
+  }
+
+  private stripUserAttachmentBodyText(body: string, attachments: DeepSeekUserAttachment[]): string {
+    if (!body || attachments.length === 0) return body
+
+    return body
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .filter((line) => !this.isUserAttachmentBodyLine(line, attachments))
+      .join("\n")
+      .trim()
+  }
+
+  private isUserAttachmentBodyLine(line: string, attachments: DeepSeekUserAttachment[]): boolean {
+    const normalizedLine = this.normalizeAttachmentComparisonText(line)
+    if (!normalizedLine) return false
+
+    return attachments.some((attachment) => {
+      const name = this.normalizeAttachmentComparisonText(attachment.name)
+      if (!name || !normalizedLine.includes(name)) return false
+
+      const size = this.normalizeAttachmentComparisonText(attachment.size)
+      if (size && normalizedLine.includes(size)) return true
+
+      const type =
+        attachment.type && !this.fileNameEndsWithExtension(attachment.name, attachment.type)
+          ? this.normalizeAttachmentComparisonText(attachment.type)
+          : ""
+      if (type && normalizedLine.includes(type)) return true
+
+      return normalizedLine === name
+    })
+  }
+
+  private extractAttachmentCardName(card: Element): string {
+    const textNodes = Array.from(card.querySelectorAll("div, span, p")).filter(
+      (node) => !node.querySelector("svg, img"),
+    )
+    const leafCandidates = textNodes
+      .filter((node) => node.children.length === 0)
+      .map((node) => this.normalizeAttachmentText(node.textContent || ""))
+      .filter(Boolean)
+    const candidates = textNodes
+      .map((node) => this.normalizeAttachmentText(node.textContent || ""))
+      .filter(Boolean)
+
+    const filename = [...leafCandidates, ...candidates].find((value) =>
+      this.looksLikeFilename(value),
+    )
+    if (filename) {
+      return filename
+    }
+
+    const ariaLabel = this.normalizeAttachmentText(card.getAttribute("aria-label") || "")
+    if (this.looksLikeFilename(ariaLabel)) {
+      return ariaLabel
+    }
+
+    const title = this.normalizeAttachmentText(card.getAttribute("title") || "")
+    if (this.looksLikeFilename(title)) {
+      return title
+    }
+
+    return ""
+  }
+
+  private extractAttachmentCardType(card: Element, name = ""): string {
+    const normalizedName = this.normalizeAttachmentText(name).toLowerCase()
+    const textParts = Array.from(card.querySelectorAll("div, span, p"))
+      .map((node) => this.normalizeAttachmentText(node.textContent || ""))
+      .filter(Boolean)
+
+    const info = textParts.find(
+      (value) =>
+        (!normalizedName || !value.toLowerCase().includes(normalizedName)) &&
+        !this.looksLikeFilename(value) &&
+        /^[A-Za-z0-9.+-]{1,12}(?:\s+\d+(?:\.\d+)?\s*[KMGT]?B)?$/i.test(value),
+    )
+    return info?.match(/^[A-Za-z0-9.+-]{1,12}/)?.[0]?.toUpperCase() || ""
+  }
+
+  private extractAttachmentCardSize(card: Element): string {
+    const text = this.normalizeAttachmentText(card.textContent || "")
+    return text.match(/\b\d+(?:\.\d+)?\s*[KMGT]?B\b/i)?.[0] || ""
+  }
+
+  private extractAttachmentCardSource(card: Element): string {
+    const links = Array.from(card.querySelectorAll("a[href]"))
+    const parentLink = card.closest("a[href]")
+    if (parentLink) links.unshift(parentLink)
+
+    for (const link of links) {
+      if (!(link instanceof HTMLAnchorElement)) continue
+      const href = normalizeExportAssetUrl(link.getAttribute("href") || link.href || "")
+      if (isDownloadableExportAssetUrl(href)) return href
+    }
+
+    return ""
+  }
+
+  private looksLikeFilename(value: string): boolean {
+    const normalized = this.normalizeAttachmentText(value)
+    if (this.isFileMetaText(normalized)) {
+      return false
+    }
+
+    return /[^/\\]+\.[A-Za-z0-9]{1,10}$/.test(normalized)
+  }
+
+  private isFileMetaText(value: string): boolean {
+    return /^[A-Za-z0-9.+-]{1,12}\s+\d+(?:\.\d+)?\s*[KMGT]?B$/i.test(value)
+  }
+
+  private isImageAttachmentName(name: string, type: string): boolean {
+    const extension = (this.extractFileTypeFromName(name) || type).toLowerCase()
+    return ["avif", "gif", "jpg", "jpeg", "png", "svg", "webp"].includes(extension)
+  }
+
+  private extractFileTypeFromName(name: string): string {
+    return name.match(/\.([A-Za-z0-9]{1,10})$/)?.[1]?.toUpperCase() || ""
+  }
+
+  private formatFileSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) return ""
+
+    const units = ["B", "KB", "MB", "GB", "TB"]
+    let value = bytes
+    let unitIndex = 0
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024
+      unitIndex += 1
+    }
+
+    const precision = value >= 10 || unitIndex === 0 ? 0 : 2
+    return `${value.toFixed(precision)}${units[unitIndex]}`
+  }
+
+  private extractFilenameFromUrl(value: string): string {
+    try {
+      const url = new URL(value, window.location.href)
+      const filename = url.searchParams.get("filename") || url.searchParams.get("file_name")
+      if (filename?.trim()) return filename.trim()
+
+      const pathname = decodeURIComponent(url.pathname)
+      return pathname.split("/").pop()?.trim() || ""
+    } catch {
+      return ""
+    }
+  }
+
+  private normalizeAttachmentText(value: string): string {
+    return value.replace(/\s+/g, " ").trim()
+  }
+
+  private normalizeAttachmentComparisonText(value: string): string {
+    return this.normalizeAttachmentText(value)
+      .toLowerCase()
+      .replace(/[（]/g, "(")
+      .replace(/[）]/g, ")")
+      .replace(/\s+/g, "")
+  }
+
+  private fileNameEndsWithExtension(name: string, extension: string): boolean {
+    const normalizedExtension = extension.toLowerCase().replace(/^\./, "").trim()
+    if (!normalizedExtension) return false
+    return name.toLowerCase().endsWith(`.${normalizedExtension}`)
+  }
+
+  private async collectExportMessageSnapshots(
+    scrollContainer: HTMLElement,
+    collector?: ExportAssetCollector,
+  ): Promise<DeepSeekExportMessageSnapshot[]> {
+    const positions = this.buildExportSnapshotPositions(scrollContainer)
+    const originalScrollTop = scrollContainer.scrollTop
+    let collected: DeepSeekExportMessageSnapshot[] = []
+
+    try {
+      for (const top of positions) {
+        scrollContainer.scrollTop = top
+        scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+        scrollContainer.getBoundingClientRect()
+        await this.waitForExportMessagesMounted(scrollContainer)
+
+        const batch = this.readVisibleExportMessageSnapshots(scrollContainer, collector)
+        collected = this.mergeExportMessageBatch(collected, batch)
+      }
+    } finally {
+      scrollContainer.scrollTop = originalScrollTop
+      scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }))
+    }
+
+    return collected
+  }
+
+  /**
+   * 挂载确认：轮询当前可见消息签名（数量 + 首尾文本长度），连续两次采样一致即稳定，
+   * 替代固定 80ms sleep——渲染慢时不再读到未挂载完成的批次，从源头避免 overlap 失配。
+   */
+  private async waitForExportMessagesMounted(
+    container: HTMLElement,
+    timeoutMs = 800,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    // 先等一帧再首采样：scroll 事件在下一帧才派发，滚动后立即采样拿到的是旧位置的消息，
+    // 慢渲染下两次采样一致会被误判为稳定（假稳定竞态）。
+    // 与 sleep 竞速：后台标签页 rAF 不触发，避免悬挂
+    await Promise.race([
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+      this.sleep(100),
+    ])
+    let lastSignature = ""
+    while (Date.now() < deadline) {
+      const signature = this.getVisibleExportMessageSignature(container)
+      if (signature && signature === lastSignature) return
+      lastSignature = signature
+      await this.sleep(60)
+    }
+  }
+
+  private getVisibleExportMessageSignature(container: HTMLElement): string {
+    const messageSelector = this.config.sitePrivateSelectors.message
+    const messages = Array.from(container.querySelectorAll(messageSelector)).filter(
+      (message): message is HTMLElement =>
+        message instanceof HTMLElement &&
+        !message.closest(`[${DEEPSEEK_EXPORT_ROOT_ATTR}]`) &&
+        !message.parentElement?.closest(messageSelector),
+    )
+    if (messages.length === 0) return ""
+    const firstLength = messages[0].textContent?.length ?? 0
+    const lastLength = messages[messages.length - 1].textContent?.length ?? 0
+    // 混入 scrollTop：同一组消息在不同滚动位置不会产生假稳定
+    return `${Math.round(container.scrollTop)}:${messages.length}:${firstLength}:${lastLength}`
+  }
+
+  private buildExportSnapshotPositions(scrollContainer: HTMLElement): number[] {
+    const maxScroll = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+    const currentScrollTop = scrollContainer.scrollTop
+
+    if (maxScroll <= 0) {
+      return [currentScrollTop]
+    }
+
+    const step = Math.max(160, Math.floor(scrollContainer.clientHeight * 0.75))
+    const positions = new Set<number>([0, currentScrollTop, maxScroll])
+
+    for (let top = 0; top < maxScroll; top += step) {
+      positions.add(top)
+    }
+
+    return Array.from(positions).sort((a, b) => a - b)
+  }
+
+  private buildBottomUpScanPositions(scrollContainer: HTMLElement): number[] {
+    const maxScroll = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+    if (maxScroll <= 0) {
+      return [scrollContainer.scrollTop]
+    }
+
+    const step = Math.max(160, Math.floor(scrollContainer.clientHeight * 0.9))
+    const positions: number[] = []
+
+    for (let top = maxScroll; top > 0; top -= step) {
+      positions.push(top)
+    }
+
+    if (positions[positions.length - 1] !== 0) {
+      positions.push(0)
+    }
+
+    return positions
+  }
+
+  private shouldIncludeThoughtsInExport(): boolean {
+    if (typeof this.exportIncludeThoughtsOverride === "boolean") {
+      return this.exportIncludeThoughtsOverride
+    }
+
+    return false
+  }
+
+  private resolveAssistantMessageElement(element: Element): HTMLElement | null {
+    if (element.matches(this.config.sitePrivateSelectors.message)) {
+      return element as HTMLElement
+    }
+
+    const message = element.closest(this.config.sitePrivateSelectors.message)
+    return message instanceof HTMLElement ? message : null
+  }
+
+  private resolveAssistantBodyMarkdownElement(element: Element): HTMLElement | null {
+    if (
+      element.matches(this.config.sitePrivateSelectors.assistantMarkdown) &&
+      !this.isThoughtMarkdownElement(element)
+    ) {
+      return element as HTMLElement
+    }
+
+    const message = this.resolveAssistantMessageElement(element)
+    if (!message) {
+      return null
+    }
+
+    return this.getAssistantBodyMarkdown(message)
+  }
+
+  private getAssistantBodyMarkdown(message: Element): HTMLElement | null {
+    const markdowns = Array.from(
+      message.querySelectorAll(this.config.sitePrivateSelectors.assistantMarkdown),
+    ).filter(
+      (markdown): markdown is HTMLElement =>
+        markdown instanceof HTMLElement && !this.isThoughtMarkdownElement(markdown),
+    )
+
+    return markdowns.length > 0 ? markdowns[markdowns.length - 1] : null
+  }
+
+  private isThoughtMarkdownElement(element: Element): boolean {
+    return element.closest(this.config.sitePrivateSelectors.thoughtContainer) !== null
+  }
+
+  private extractThoughtBlockquotesFromMessage(message: Element): string[] {
+    const thoughtMarkdowns = Array.from(
+      message.querySelectorAll(
+        `${this.config.sitePrivateSelectors.thoughtContainer} ${this.config.sitePrivateSelectors.assistantMarkdown}`,
+      ),
+    ).filter((markdown): markdown is HTMLElement => markdown instanceof HTMLElement)
+
+    const thoughtTexts = thoughtMarkdowns
+      .map((markdown) => this.extractMarkdownText(markdown))
+      .filter(Boolean)
+
+    if (thoughtTexts.length === 0) return []
+
+    return [this.formatAsThoughtBlockquote(thoughtTexts.join("\n\n"))]
+  }
+
+  private extractMarkdownText(element: Element): string {
+    const clone = element.cloneNode(true) as HTMLElement
+    clone
+      .querySelectorAll(
+        `button, [role="button"], svg, ${this.config.sitePrivateSelectors.iconButton}, ${this.config.sitePrivateSelectors.focusRing}, [aria-hidden="true"]`,
+      )
+      .forEach((node) => node.remove())
+
+    const content = htmlToMarkdown(clone).trim()
+    if (content) {
+      return content
+    }
+
+    return this.extractTextWithLineBreaks(clone).trim()
+  }
+
+  private formatAsThoughtBlockquote(markdown: string): string {
+    const lines = markdown.replace(/\r\n/g, "\n").split("\n")
+    const quotedLines = lines.map((line) => (line.trim().length > 0 ? `> ${line}` : ">"))
+    return ["> [Thoughts]", ...quotedLines].join("\n")
+  }
+
+  private getVisibleAssistantMessages(container: ParentNode): HTMLElement[] {
+    return Array.from(container.querySelectorAll(this.config.selectors.assistantResponse)).filter(
+      (message): message is HTMLElement =>
+        message instanceof HTMLElement &&
+        !message.closest(`[${DEEPSEEK_EXPORT_ROOT_ATTR}]`) &&
+        !message.closest(".gh-root") &&
+        !message.parentElement?.closest(this.config.sitePrivateSelectors.message),
+    )
+  }
+
+  private extractLatestReplyTextFromMessages(messages: HTMLElement[]): string | null {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const text = this.extractAssistantResponseText(messages[i]).trim()
+      if (text) {
+        return text
+      }
+    }
+
+    return null
+  }
+
+  private extractLastCodeBlockTextFromMessages(messages: HTMLElement[]): string | null {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i]
+      const bodyMarkdown = this.getAssistantBodyMarkdown(message)
+      if (!bodyMarkdown) continue
+
+      const markdownText = this.extractAssistantResponseText(message)
+      const fromMarkdown = this.extractLastFencedCodeBlock(markdownText)
+      if (fromMarkdown) {
+        return fromMarkdown
+      }
+
+      const fromDom = this.extractLastCodeBlockTextFromDom(bodyMarkdown)
+      if (fromDom) {
+        return fromDom
+      }
+    }
+
+    return null
+  }
+
+  private extractLastFencedCodeBlock(markdown: string): string | null {
+    if (!markdown) {
+      return null
+    }
+
+    const pattern = /```[^\n]*\n([\s\S]*?)```/g
+    let lastMatch: string | null = null
+
+    for (const match of markdown.matchAll(pattern)) {
+      lastMatch = match[1] || null
+    }
+
+    if (!lastMatch || !lastMatch.trim()) {
+      return null
+    }
+
+    return lastMatch.replace(/\r\n/g, "\n").replace(/\n+$/, "")
+  }
+
+  private extractLastCodeBlockTextFromDom(markdown: Element): string | null {
+    const candidates = Array.from(markdown.querySelectorAll("pre code, pre"))
+
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      const candidate = candidates[i]
+      if (!(candidate instanceof HTMLElement)) continue
+
+      const clone = candidate.cloneNode(true) as HTMLElement
+      clone
+        .querySelectorAll(
+          `button, [role="button"], svg, ${this.config.sitePrivateSelectors.iconButton}, [aria-hidden="true"]`,
+        )
+        .forEach((node) => node.remove())
+
+      const text = clone.textContent?.replace(/\r\n/g, "\n").replace(/\n+$/, "") || ""
+      if (text.trim()) {
+        return text
+      }
+    }
+
+    return null
+  }
+
+  private readVisibleExportMessageSnapshots(
+    container: ParentNode,
+    collector?: ExportAssetCollector,
+  ): DeepSeekExportMessageSnapshot[] {
+    const messageSelector = this.config.sitePrivateSelectors.message
+    const messages = Array.from(container.querySelectorAll(messageSelector)).filter(
+      (message): message is HTMLElement =>
+        message instanceof HTMLElement &&
+        !message.closest(`[${DEEPSEEK_EXPORT_ROOT_ATTR}]`) &&
+        !message.parentElement?.closest(messageSelector),
+    )
+
+    return messages
+      .map((message) => this.extractExportMessageSnapshot(message, collector))
+      .filter((message): message is DeepSeekExportMessageSnapshot => message !== null)
+  }
+
+  private extractExportMessageSnapshot(
+    message: Element,
+    collector?: ExportAssetCollector,
+  ): DeepSeekExportMessageSnapshot | null {
+    const markdown = this.getAssistantBodyMarkdown(message)
+    if (markdown) {
+      const content = this.normalizeExportMessageContent(this.extractAssistantResponseText(message))
+      return content
+        ? {
+            role: DEEPSEEK_EXPORT_ROLE_ASSISTANT,
+            content,
+          }
+        : null
+    }
+
+    const content = this.normalizeExportMessageContent(
+      this.extractDeepSeekUserQueryExportContent(message, collector),
+    )
+    return content
+      ? {
+          role: DEEPSEEK_EXPORT_ROLE_USER,
+          content,
+        }
+      : null
+  }
+
+  private normalizeExportMessageContent(content: string): string {
+    return content
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .trim()
+  }
+
+  private mergeExportMessageBatch(
+    collected: DeepSeekExportMessageSnapshot[],
+    batch: DeepSeekExportMessageSnapshot[],
+  ): DeepSeekExportMessageSnapshot[] {
+    if (batch.length === 0) {
+      return collected
+    }
+
+    if (collected.length === 0) {
+      return batch.map((item) => ({ ...item }))
+    }
+
+    const maxOverlap = Math.min(collected.length, batch.length)
+    for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+      const collectedTail = collected.slice(-overlap)
+      const batchHead = batch.slice(0, overlap)
+      if (this.exportMessageSequenceEquals(collectedTail, batchHead)) {
+        return [...collected, ...batch.slice(overlap).map((item) => ({ ...item }))]
+      }
+    }
+
+    const merged = collected.map((item) => ({ ...item }))
+    batch.forEach((item) => {
+      if (!this.exportMessageEntryEquals(merged[merged.length - 1], item)) {
+        merged.push({ ...item })
+      }
+    })
+    return merged
+  }
+
+  private exportMessageSequenceEquals(
+    left: DeepSeekExportMessageSnapshot[],
+    right: DeepSeekExportMessageSnapshot[],
+  ): boolean {
+    if (left.length !== right.length) {
+      return false
+    }
+
+    return left.every((item, index) => this.exportMessageEntryEquals(item, right[index]))
+  }
+
+  private exportMessageEntryEquals(
+    left: DeepSeekExportMessageSnapshot | undefined,
+    right: DeepSeekExportMessageSnapshot | undefined,
+  ): boolean {
+    if (!left || !right) {
+      return false
+    }
+
+    return left.role === right.role && left.content === right.content
+  }
+
+  private mountExportSnapshot(messages: DeepSeekExportMessageSnapshot[]): void {
+    this.clearExportSnapshot()
+
+    const root = document.createElement("div")
+    root.setAttribute(DEEPSEEK_EXPORT_ROOT_ATTR, "1")
+    root.style.display = "none"
+
+    messages.forEach((message) => {
+      const node = document.createElement("div")
+      node.setAttribute(DEEPSEEK_EXPORT_ROLE_ATTR, message.role)
+      node.textContent = message.content
+      root.appendChild(node)
+    })
+
+    document.body.appendChild(root)
+    this.exportSnapshotRoot = root
+    this.exportSnapshotActive = true
+  }
+
+  private clearExportSnapshot(): void {
+    this.exportSnapshotActive = false
+    const root = this.exportSnapshotRoot
+    this.exportSnapshotRoot = null
+
+    if (root?.isConnected) {
+      root.remove()
+    }
+
+    document.querySelectorAll(`[${DEEPSEEK_EXPORT_ROOT_ATTR}]`).forEach((node) => {
+      if (node !== root) {
+        node.parentNode?.removeChild(node)
+      }
+    })
+  }
+
+  private async deleteConversationViaApi(
+    target: ConversationDeleteTarget,
+    token: string,
+  ): Promise<SiteDeleteConversationResult> {
+    try {
+      const response = await fetch(CHAT_DELETE_API_PATH, {
+        method: "POST",
+        headers: this.buildDeleteHeaders(token),
+        body: JSON.stringify({ chat_session_id: target.id }),
+        credentials: "include",
+      })
+
+      if (!response.ok) {
+        return {
+          id: target.id,
+          success: false,
+          method: "api",
+          reason: this.toDeleteApiHttpReason(response.status),
+        }
+      }
+
+      const payload = await this.safeParseJson(response)
+      if (this.isDeleteSuccessPayload(payload)) {
+        return {
+          id: target.id,
+          success: true,
+          method: "api",
+        }
+      }
+
+      return {
+        id: target.id,
+        success: false,
+        method: "api",
+        reason: this.toDeleteApiPayloadReason(payload),
+      }
+    } catch {
+      return {
+        id: target.id,
+        success: false,
+        method: "api",
+        reason: DEEPSEEK_DELETE_REASON.API_REQUEST_FAILED,
+      }
+    }
+  }
+
+  private buildDeleteHeaders(token: string): Record<string, string> {
+    return {
+      accept: "*/*",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "x-client-platform": "web",
+      "x-client-locale": this.getClientLocale(),
+      "x-client-timezone-offset": String(-new Date().getTimezoneOffset() * 60),
+    }
+  }
+
+  private getUserToken(): string | null {
+    const raw = localStorage.getItem(USER_TOKEN_STORAGE_KEY)
+    if (!raw) return null
+
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      const value = parsed.value
+      if (typeof value === "string" && value.trim()) {
+        return value.trim()
+      }
+    } catch {
+      // ignore malformed token payload and fall back to raw string
+    }
+
+    const normalized = raw.trim().replace(/^"|"$/g, "")
+    return normalized || null
+  }
+
+  private getClientLocale(): string {
+    const lang = document.documentElement.lang || navigator.language || "en-US"
+    return lang.replace(/-/g, "_")
+  }
+
+  private isDeleteSuccessPayload(payload: unknown): boolean {
+    if (!payload || typeof payload !== "object") return false
+
+    const data = payload as Record<string, unknown>
+    if (data.code !== 0) return false
+
+    const responseData = data.data
+    if (!responseData || typeof responseData !== "object") {
+      return true
+    }
+
+    const bizCode = (responseData as Record<string, unknown>).biz_code
+    return bizCode === undefined || bizCode === 0
+  }
+
+  private toDeleteApiPayloadReason(payload: unknown): string {
+    if (!payload || typeof payload !== "object") {
+      return DEEPSEEK_DELETE_REASON.API_INVALID_RESPONSE
+    }
+
+    const data = payload as Record<string, unknown>
+    if (typeof data.msg === "string" && data.msg.trim()) {
+      return `${DEEPSEEK_DELETE_REASON.API_BUSINESS_FAILED}:${data.msg.trim()}`
+    }
+
+    const nested = data.data
+    if (nested && typeof nested === "object") {
+      const nestedData = nested as Record<string, unknown>
+      if (typeof nestedData.biz_msg === "string" && nestedData.biz_msg.trim()) {
+        return `${DEEPSEEK_DELETE_REASON.API_BUSINESS_FAILED}:${nestedData.biz_msg.trim()}`
+      }
+    }
+
+    return DEEPSEEK_DELETE_REASON.API_BUSINESS_FAILED
+  }
+
+  private toDeleteApiHttpReason(status: number): string {
+    switch (status) {
+      case 401:
+      case 403:
+        return "delete_api_unauthorized"
+      case 404:
+        return "delete_api_not_found"
+      case 429:
+        return "delete_api_rate_limited"
+      default:
+        return `delete_api_http_${status || 0}`
+    }
+  }
+
+  private async safeParseJson(response: Response): Promise<unknown> {
+    try {
+      return await response.json()
+    } catch {
+      return null
+    }
+  }
+
+  private scheduleHomeRefreshAfterDelete() {
+    try {
+      sessionStorage.setItem(DELETE_REFRESH_STORAGE_KEY, "1")
+    } catch {
+      // ignore storage failures and still try to redirect
+    }
+
+    window.location.replace(DEEPSEEK_HOME_URL)
+  }
+
+  private schedulePageReloadAfterDelete() {
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 0)
+  }
+
+  private consumePendingDeleteRefresh() {
+    let shouldRefresh = false
+
+    try {
+      shouldRefresh = sessionStorage.getItem(DELETE_REFRESH_STORAGE_KEY) === "1"
+      if (!shouldRefresh) return
+      sessionStorage.removeItem(DELETE_REFRESH_STORAGE_KEY)
+    } catch {
+      return
+    }
+
+    const isHomePage = window.location.pathname === "/" || window.location.pathname === ""
+    if (!isHomePage) {
+      try {
+        sessionStorage.setItem(DELETE_REFRESH_STORAGE_KEY, "1")
+      } catch {
+        // ignore storage failures and still try to redirect
+      }
+      window.location.replace(DEEPSEEK_HOME_URL)
+      return
+    }
+
+    setTimeout(() => {
+      window.location.reload()
+    }, 0)
+  }
+
+  private findNextAssistantMarkdown(messages: Element[], currentIndex: number): Element | null {
+    for (let i = currentIndex + 1; i < messages.length; i++) {
+      const markdown = this.getAssistantBodyMarkdown(messages[i])
+      if (markdown) {
+        return markdown
+      }
+    }
+
+    return null
+  }
+
+  private extractConversationInfo(el: Element, cid?: string): ConversationInfo | null {
+    const href = el.getAttribute(this.config.conversation.idFrom.attr ?? "href") || ""
+    const match = href.match(new RegExp(this.config.conversation.idFrom.regex, "i"))
+    if (!match) return null
+
+    const id = match[1]
+    const title = this.extractConversationTitle(el)
+    const url = new URL(href, window.location.origin).toString()
+    const isActive =
+      (this.config.conversation.activeMatch
+        ? el.matches(this.config.conversation.activeMatch)
+        : false) ||
+      new URL(url).pathname === window.location.pathname ||
+      id === this.getSessionId()
+
+    return {
+      id,
+      cid,
+      title,
+      url,
+      isActive,
+      isPinned: this.isPinnedConversationLink(el),
+    }
+  }
+
+  private getShareConversationTitle(): string | null {
+    const messageSelector = this.config.sitePrivateSelectors.message
+    const firstUserMessage = Array.from(
+      document.querySelectorAll(this.config.selectors.userQuery),
+    ).find((message) => !message.parentElement?.closest(messageSelector))
+    const firstUserText = firstUserMessage ? this.extractUserQueryText(firstUserMessage) : ""
+    const normalizedUserText = this.normalizeOutlineText(firstUserText)
+
+    if (normalizedUserText) {
+      return normalizedUserText.length > 80
+        ? `${normalizedUserText.slice(0, 80)}...`
+        : normalizedUserText
+    }
+
+    const metaTitle = document
+      .querySelector(this.config.sitePrivateSelectors.shareTitleMeta)
+      ?.getAttribute("content")
+      ?.replace(/\s*[-|]\s*DeepSeek$/i, "")
+      ?.trim()
+
+    if (metaTitle && metaTitle !== "来自分享的对话") {
+      return metaTitle
+    }
+
+    return metaTitle || "DeepSeek Share"
+  }
+
+  private isPinnedConversationLink(link: Element): boolean {
+    const group = this.findConversationGroup(link)
+    if (!group) return false
+
+    const directChildren = Array.from(group.children)
+    const conversationChildren = directChildren.filter((child) => this.isConversationLink(child))
+    if (conversationChildren.length === 0) return false
+
+    const firstConversation = conversationChildren[0]
+    const firstConversationIndex = directChildren.indexOf(firstConversation)
+    if (firstConversationIndex <= 0) return false
+
+    const header = directChildren.find(
+      (child, index) => index < firstConversationIndex && !this.isConversationLink(child),
+    )
+    if (!header) return false
+
+    const hasElementChildren = header.children.length > 0
+    const hasFocusRing = header.querySelector(this.config.sitePrivateSelectors.focusRing) !== null
+    const hasSpan = header.querySelector(":scope > span, span") !== null
+
+    return hasElementChildren && hasFocusRing && hasSpan
+  }
+
+  private findConversationGroup(link: Element): HTMLElement | null {
+    let current = link.parentElement
+
+    while (current && current !== document.body) {
+      const directChildren = Array.from(current.children)
+      const conversationChildren = directChildren.filter((child) => this.isConversationLink(child))
+
+      if (conversationChildren.length > 0) {
+        const firstConversationIndex = directChildren.indexOf(conversationChildren[0])
+        const hasHeaderBeforeConversation = directChildren.some(
+          (child, index) => index < firstConversationIndex && !this.isConversationLink(child),
+        )
+
+        if (hasHeaderBeforeConversation && conversationChildren.some((child) => child === link)) {
+          return current
+        }
+      }
+
+      current = current.parentElement
+    }
+
+    return null
+  }
+
+  private isConversationLink(element: Element): boolean {
+    return element.matches(this.config.conversation.itemSelector)
+  }
+
+  private extractConversationTitle(el: Element): string {
+    const ariaLabel = el.getAttribute("aria-label")?.trim()
+    if (ariaLabel) return ariaLabel
+
+    const titleElement = this.findTitleElement(el)
+    const titleText =
+      (titleElement as HTMLElement | null)?.innerText?.trim() ||
+      titleElement?.textContent?.trim() ||
+      ""
+
+    if (titleText) {
+      return titleText.replace(/\s+/g, " ").trim()
+    }
+
+    const linkText = (el as HTMLElement).innerText?.trim() || el.textContent?.trim() || ""
+    return linkText.replace(/\s+/g, " ").trim()
+  }
+
+  private findTitleElement(el: Element): Element | null {
+    const directChildren = Array.from(el.children)
+    const directTitleChild = directChildren.find((child) => {
+      if (!(child instanceof HTMLElement)) return false
+      if (child.matches(this.config.sitePrivateSelectors.focusRing)) return false
+      if (child.querySelector(`[role="button"], ${this.config.sitePrivateSelectors.iconButton}`)) {
+        return false
+      }
+      return !!child.innerText?.trim()
+    })
+    if (directTitleChild) return directTitleChild
+
+    const candidates = el.querySelectorAll("span, p, div")
+    for (const candidate of Array.from(candidates)) {
+      const text =
+        (candidate as HTMLElement).innerText?.trim() || candidate.textContent?.trim() || ""
+      if (text) return candidate
+    }
+
+    return el
+  }
+
+  private findUserContentRoot(element: Element): Element | null {
+    const message = this.resolveUserMessageElement(element)
+    if (!message) return null
+
+    const candidates = Array.from(message.children).filter((child) => {
+      if (!(child instanceof HTMLElement)) return false
+      if (this.isLikelyUserMessageDecoration(child)) return false
+      if (this.isLikelyUserAttachmentContainer(child)) return false
+      return Boolean(child.innerText?.trim())
+    })
+
+    return candidates[0] || null
+  }
+
+  private isLikelyUserMessageDecoration(element: Element): boolean {
+    return element.matches(
+      `.gh-inline-bookmark, .gh-user-query-raw, .gh-user-query-markdown, button, [role=button], ${this.config.sitePrivateSelectors.iconButton}, ${this.config.sitePrivateSelectors.focusRing}`,
+    )
+  }
+}

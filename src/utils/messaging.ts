@@ -1,0 +1,494 @@
+import type { NetworkMonitorRequestBodyRule } from "~adapters/base"
+import type { RemoteConfigCheckResult, RemoteConfigState } from "~core/remote-config-types"
+import type { SitePackOriginBinding } from "~core/site-pack-origin-bindings"
+import type {
+  SitePackOriginBindingIssue,
+  SitePackOriginReferenceEntry,
+} from "~core/site-pack-origin-references"
+
+/**
+ * Messaging Protocol Definitions
+ */
+
+// ============================================================================
+// Content Script <-> Background Service Worker
+// ============================================================================
+
+export const MSG_SHOW_NOTIFICATION = "SHOW_NOTIFICATION"
+export const MSG_FOCUS_TAB = "FOCUS_TAB"
+
+export interface ShowNotificationPayload {
+  title: string
+  body: string
+}
+
+export interface ShowNotificationMessage extends ShowNotificationPayload {
+  type: typeof MSG_SHOW_NOTIFICATION
+}
+
+export interface FocusTabMessage {
+  type: typeof MSG_FOCUS_TAB
+}
+
+export const MSG_PROXY_FETCH = "PROXY_FETCH"
+
+export interface ProxyFetchPayload {
+  url: string
+}
+
+export interface ProxyFetchMessage extends ProxyFetchPayload {
+  type: typeof MSG_PROXY_FETCH
+}
+
+export const MSG_CHECK_REMOTE_CONFIG = "CHECK_REMOTE_CONFIG"
+
+export interface CheckRemoteConfigPayload {
+  force?: boolean
+  sources?: string[]
+}
+
+export interface CheckRemoteConfigMessage extends CheckRemoteConfigPayload {
+  type: typeof MSG_CHECK_REMOTE_CONFIG
+}
+
+export interface CheckRemoteConfigResponse {
+  success: boolean
+  result?: RemoteConfigCheckResult
+  error?: string
+}
+
+export const MSG_GET_REMOTE_CONFIG_STATE = "GET_REMOTE_CONFIG_STATE"
+
+export interface GetRemoteConfigStateMessage {
+  type: typeof MSG_GET_REMOTE_CONFIG_STATE
+}
+
+export interface GetRemoteConfigStateResponse {
+  success: boolean
+  state?: RemoteConfigState
+  error?: string
+}
+
+export const MSG_IGNORE_REMOTE_CONFIG_PATCH = "IGNORE_REMOTE_CONFIG_PATCH"
+
+export interface IgnoreRemoteConfigPatchPayload {
+  siteId: string
+  patchVersion?: number
+}
+
+export interface IgnoreRemoteConfigPatchMessage extends IgnoreRemoteConfigPatchPayload {
+  type: typeof MSG_IGNORE_REMOTE_CONFIG_PATCH
+}
+
+export const MSG_INSTALL_LOCAL_REMOTE_CONFIG_PATCH = "INSTALL_LOCAL_REMOTE_CONFIG_PATCH"
+
+export interface InstallLocalRemoteConfigPatchPayload {
+  patch: unknown
+  fileName?: string
+}
+
+export interface InstallLocalRemoteConfigPatchMessage extends InstallLocalRemoteConfigPatchPayload {
+  type: typeof MSG_INSTALL_LOCAL_REMOTE_CONFIG_PATCH
+}
+
+export const MSG_REMOVE_LOCAL_REMOTE_CONFIG_PATCH = "REMOVE_LOCAL_REMOTE_CONFIG_PATCH"
+
+export interface RemoveLocalRemoteConfigPatchPayload {
+  siteId: string
+}
+
+export interface RemoveLocalRemoteConfigPatchMessage extends RemoveLocalRemoteConfigPatchPayload {
+  type: typeof MSG_REMOVE_LOCAL_REMOTE_CONFIG_PATCH
+}
+
+export const MSG_CLEAR_REMOTE_CONFIG_CACHE = "CLEAR_REMOTE_CONFIG_CACHE"
+
+export interface ClearRemoteConfigCacheMessage {
+  type: typeof MSG_CLEAR_REMOTE_CONFIG_CACHE
+}
+
+export const MSG_RESET_REMOTE_CONFIG_SITE = "RESET_REMOTE_CONFIG_SITE"
+
+export interface ResetRemoteConfigSitePayload {
+  siteId: string
+}
+
+export interface ResetRemoteConfigSiteMessage extends ResetRemoteConfigSitePayload {
+  type: typeof MSG_RESET_REMOTE_CONFIG_SITE
+}
+
+export const MSG_REAPPLY_REMOTE_CONFIG_SITE = "REAPPLY_REMOTE_CONFIG_SITE"
+
+export interface ReapplyRemoteConfigSitePayload {
+  siteId: string
+}
+
+export interface ReapplyRemoteConfigSiteMessage extends ReapplyRemoteConfigSitePayload {
+  type: typeof MSG_REAPPLY_REMOTE_CONFIG_SITE
+}
+
+// WebDAV 代理请求（绕过 CORS）
+export const MSG_WEBDAV_REQUEST = "WEBDAV_REQUEST"
+
+export interface WebDAVRequestPayload {
+  method: string
+  url: string
+  body?: string | null
+  headers?: Record<string, string>
+  auth?: { username: string; password: string }
+}
+
+export interface WebDAVRequestMessage extends WebDAVRequestPayload {
+  type: typeof MSG_WEBDAV_REQUEST
+}
+
+// 检查权限
+export const MSG_CHECK_PERMISSION = "CHECK_PERMISSION"
+
+export interface CheckPermissionPayload {
+  origin: string
+}
+
+export interface CheckPermissionMessage extends CheckPermissionPayload {
+  type: typeof MSG_CHECK_PERMISSION
+}
+
+export interface PermissionCheckResponse {
+  success: boolean
+  hasPermission: boolean
+  error?: string
+}
+
+// 检查多个权限（用于权限管理页面）
+export const MSG_CHECK_PERMISSIONS = "CHECK_PERMISSIONS"
+
+export interface CheckPermissionsPayload {
+  origins?: string[]
+  permissions?: string[]
+}
+
+export interface CheckPermissionsMessage extends CheckPermissionsPayload {
+  type: typeof MSG_CHECK_PERMISSIONS
+}
+
+// 请求权限
+export const MSG_REQUEST_PERMISSIONS = "REQUEST_PERMISSIONS"
+
+export interface RequestPermissionsPayload {
+  origins?: string[]
+  permissions?: string[]
+  permType?: string
+}
+
+export interface RequestPermissionsMessage extends RequestPermissionsPayload {
+  type: typeof MSG_REQUEST_PERMISSIONS
+}
+
+export interface BasicBackgroundResponse {
+  success: boolean
+  error?: string
+}
+
+export const MSG_ENSURE_SITE_PACK_ORIGINS = "ENSURE_SITE_PACK_ORIGINS"
+
+export interface EnsureSitePackOriginsMessage {
+  type: typeof MSG_ENSURE_SITE_PACK_ORIGINS
+  packId: string
+}
+
+export interface EnsureSitePackOriginsResponse extends BasicBackgroundResponse {
+  granted?: boolean
+  origins?: string[]
+  missingOrigins?: string[]
+}
+
+export const MSG_ENSURE_SITE_PACK_BINDING_ORIGIN = "ENSURE_SITE_PACK_BINDING_ORIGIN"
+
+export interface EnsureSitePackBindingOriginMessage {
+  type: typeof MSG_ENSURE_SITE_PACK_BINDING_ORIGIN
+  origin: string
+  binding: SitePackOriginBinding
+  requestName: string
+}
+
+export interface EnsureSitePackBindingOriginResponse extends BasicBackgroundResponse {
+  granted?: boolean
+  origins?: string[]
+  missingOrigins?: string[]
+}
+
+export const MSG_RECONCILE_SITE_PACK_REGISTRATIONS = "RECONCILE_SITE_PACK_REGISTRATIONS"
+
+export interface ReconcileSitePackRegistrationsMessage {
+  type: typeof MSG_RECONCILE_SITE_PACK_REGISTRATIONS
+}
+
+export interface ReconcileSitePackRegistrationsResponse extends BasicBackgroundResponse {
+  activeOrigins?: string[]
+  missingPermissionOrigins?: string[]
+  originReferences?: SitePackOriginReferenceEntry[]
+  bindingIssues?: SitePackOriginBindingIssue[]
+}
+
+// 撤销权限
+export const MSG_REVOKE_PERMISSIONS = "REVOKE_PERMISSIONS"
+
+export interface RevokePermissionsPayload {
+  origins?: string[]
+  permissions?: string[]
+}
+
+export interface RevokePermissionsMessage extends RevokePermissionsPayload {
+  type: typeof MSG_REVOKE_PERMISSIONS
+}
+
+// 打开 Options 页面
+export const MSG_OPEN_OPTIONS_PAGE = "OPEN_OPTIONS_PAGE"
+
+export interface OpenOptionsPageMessage {
+  type: typeof MSG_OPEN_OPTIONS_PAGE
+}
+
+// 打开 URL（用于 chrome:// 等特殊协议）
+export const MSG_OPEN_URL = "OPEN_URL"
+
+export interface OpenUrlPayload {
+  url: string
+}
+
+export interface OpenUrlMessage extends OpenUrlPayload {
+  type: typeof MSG_OPEN_URL
+}
+
+// 扩展有新版本可用（通知页面展示刷新提示）
+export const MSG_EXTENSION_UPDATE_AVAILABLE = "EXTENSION_UPDATE_AVAILABLE"
+
+export interface ExtensionUpdateAvailablePayload {
+  version?: string
+}
+
+export interface ExtensionUpdateAvailableMessage extends ExtensionUpdateAvailablePayload {
+  type: typeof MSG_EXTENSION_UPDATE_AVAILABLE
+}
+
+// 清除全部数据（通知各上下文重置内存态）
+export const MSG_CLEAR_ALL_DATA = "CLEAR_ALL_DATA"
+
+export interface ClearAllDataMessage {
+  type: typeof MSG_CLEAR_ALL_DATA
+}
+
+export interface ClearAllDataResponse extends BasicBackgroundResponse {
+  tabs?: number
+}
+
+// 恢复备份数据（通知各上下文重载页面以加载最新数据）
+export const MSG_RESTORE_DATA = "RESTORE_DATA"
+
+export interface RestoreDataMessage {
+  type: typeof MSG_RESTORE_DATA
+}
+
+export interface RestoreDataResponse extends BasicBackgroundResponse {
+  tabs?: number
+  activeOrigins?: string[]
+  missingPermissionOrigins?: string[]
+}
+
+// 设置Claude SessionKey Cookie
+export const MSG_SET_CLAUDE_SESSION_KEY = "SET_CLAUDE_SESSION_KEY"
+
+export interface SetClaudeSessionKeyPayload {
+  key: string // SessionKey值,空字符串表示移除cookie(使用默认)
+}
+
+export interface SetClaudeSessionKeyMessage extends SetClaudeSessionKeyPayload {
+  type: typeof MSG_SET_CLAUDE_SESSION_KEY
+}
+
+// 测试Claude SessionKey有效性（通过background代理绕过CORS）
+export const MSG_TEST_CLAUDE_TOKEN = "TEST_CLAUDE_TOKEN"
+
+export interface TestClaudeTokenPayload {
+  sessionKey: string // 要测试的SessionKey
+}
+
+export interface TestClaudeTokenMessage extends TestClaudeTokenPayload {
+  type: typeof MSG_TEST_CLAUDE_TOKEN
+}
+
+// 获取Claude SessionKey Cookie（从background获取，绕过权限限制）
+export const MSG_GET_CLAUDE_SESSION_KEY = "GET_CLAUDE_SESSION_KEY"
+
+export interface GetClaudeSessionKeyMessage {
+  type: typeof MSG_GET_CLAUDE_SESSION_KEY
+}
+
+// 检测Claude页面是否正在生成（用于测试前安全检查）
+export const MSG_CHECK_CLAUDE_GENERATING = "CHECK_CLAUDE_GENERATING"
+
+export interface CheckClaudeGeneratingMessage {
+  type: typeof MSG_CHECK_CLAUDE_GENERATING
+}
+
+export interface CheckClaudeGeneratingResponse {
+  success: boolean
+  isGenerating: boolean
+  error?: string
+}
+
+export type ExtensionMessage =
+  | ShowNotificationMessage
+  | FocusTabMessage
+  | ProxyFetchMessage
+  | CheckRemoteConfigMessage
+  | GetRemoteConfigStateMessage
+  | IgnoreRemoteConfigPatchMessage
+  | InstallLocalRemoteConfigPatchMessage
+  | RemoveLocalRemoteConfigPatchMessage
+  | ClearRemoteConfigCacheMessage
+  | ResetRemoteConfigSiteMessage
+  | ReapplyRemoteConfigSiteMessage
+  | WebDAVRequestMessage
+  | CheckPermissionMessage
+  | CheckPermissionsMessage
+  | RequestPermissionsMessage
+  | EnsureSitePackOriginsMessage
+  | EnsureSitePackBindingOriginMessage
+  | ReconcileSitePackRegistrationsMessage
+  | RevokePermissionsMessage
+  | OpenOptionsPageMessage
+  | OpenUrlMessage
+  | ExtensionUpdateAvailableMessage
+  | ClearAllDataMessage
+  | RestoreDataMessage
+  | SetClaudeSessionKeyMessage
+  | TestClaudeTokenMessage
+  | GetClaudeSessionKeyMessage
+  | CheckClaudeGeneratingMessage
+  | SwitchNextClaudeKeyMessage
+  | GetAIStudioModelsMessage
+
+export const MSG_SWITCH_NEXT_CLAUDE_KEY = "SWITCH_NEXT_CLAUDE_KEY"
+
+export interface SwitchNextClaudeKeyMessage {
+  type: typeof MSG_SWITCH_NEXT_CLAUDE_KEY
+}
+
+// 获取 AI Studio 模型列表（从 content script 获取）
+export const MSG_GET_AISTUDIO_MODELS = "GET_AISTUDIO_MODELS"
+
+export interface GetAIStudioModelsMessage {
+  type: typeof MSG_GET_AISTUDIO_MODELS
+}
+
+// Popup -> Content Script: 触发当前站点的新对话
+export const MSG_START_NEW_CONVERSATION = "START_NEW_CONVERSATION"
+
+export interface StartNewConversationMessage {
+  type: typeof MSG_START_NEW_CONVERSATION
+}
+
+export interface AIStudioModelInfo {
+  id: string
+  name: string
+}
+
+export interface AIStudioModelsResponse {
+  success: boolean
+  models?: AIStudioModelInfo[]
+  error?: string
+  message?: string
+}
+
+interface BackgroundResponseMap {
+  [MSG_CHECK_REMOTE_CONFIG]: CheckRemoteConfigResponse
+  [MSG_GET_REMOTE_CONFIG_STATE]: GetRemoteConfigStateResponse
+  [MSG_IGNORE_REMOTE_CONFIG_PATCH]: BasicBackgroundResponse
+  [MSG_INSTALL_LOCAL_REMOTE_CONFIG_PATCH]: BasicBackgroundResponse
+  [MSG_REMOVE_LOCAL_REMOTE_CONFIG_PATCH]: BasicBackgroundResponse
+  [MSG_CLEAR_REMOTE_CONFIG_CACHE]: BasicBackgroundResponse
+  [MSG_CHECK_PERMISSION]: PermissionCheckResponse
+  [MSG_CHECK_PERMISSIONS]: PermissionCheckResponse
+  [MSG_REQUEST_PERMISSIONS]: BasicBackgroundResponse
+  [MSG_ENSURE_SITE_PACK_ORIGINS]: EnsureSitePackOriginsResponse
+  [MSG_ENSURE_SITE_PACK_BINDING_ORIGIN]: EnsureSitePackBindingOriginResponse
+  [MSG_RECONCILE_SITE_PACK_REGISTRATIONS]: ReconcileSitePackRegistrationsResponse
+  [MSG_CLEAR_ALL_DATA]: ClearAllDataResponse
+  [MSG_RESTORE_DATA]: RestoreDataResponse
+  [MSG_CHECK_CLAUDE_GENERATING]: CheckClaudeGeneratingResponse
+  [MSG_GET_AISTUDIO_MODELS]: AIStudioModelsResponse
+}
+
+type BackgroundResponseFor<T extends ExtensionMessage> =
+  T["type"] extends keyof BackgroundResponseMap ? BackgroundResponseMap[T["type"]] : any
+
+/**
+ * Send a message to the background service worker with type safety
+ */
+export function sendToBackground<T extends ExtensionMessage>(
+  message: T,
+): Promise<BackgroundResponseFor<T>> {
+  return chrome.runtime.sendMessage(message)
+}
+
+// ============================================================================
+// Main World (Monitor) <-> Isolated World (Content Script)
+// ============================================================================
+
+export const EVENT_MONITOR_INIT = "GH_MONITOR_INIT"
+export const EVENT_MONITOR_START = "GH_MONITOR_START"
+export const EVENT_MONITOR_COMPLETE = "GH_MONITOR_COMPLETE"
+export const EVENT_GEMINI_MYSTUFF_SYNC_REQUEST = "OPHEL_GEMINI_MYSTUFF_SYNC_REQUEST"
+export const EVENT_GEMINI_MYSTUFF_CACHE_SYNC = "OPHEL_GEMINI_MYSTUFF_CACHE_SYNC"
+export const EVENT_EXTENSION_UPDATE_AVAILABLE = "OPHEL_EXTENSION_UPDATE_AVAILABLE"
+export const EVENT_PAGE_URL_CHANGE = "OPHEL_PAGE_URL_CHANGE"
+
+export interface MonitorConfigPayload {
+  urlPatterns: string[]
+  urlPathEndsWith?: string[]
+  silenceThreshold: number
+  requestBodyRules?: NetworkMonitorRequestBodyRule[]
+}
+
+export interface MonitorEventPayload {
+  url?: string
+  timestamp: number
+  activeCount?: number
+  lastUrl?: string
+  type?: string
+  domCompletionRequired?: boolean
+}
+
+export type GeminiMyStuffKind = "media" | "document"
+
+export interface GeminiMyStuffRecord {
+  kind: GeminiMyStuffKind
+  conversationId: string
+  responseId: string
+  timestamp: number
+  timestampNano: number
+  status: number
+  title?: string
+  resourceId?: string
+  thumbnailUrl?: string
+}
+
+export interface GeminiMyStuffSyncRequestPayload {
+  requestId: string
+  force?: boolean
+  kinds?: GeminiMyStuffKind[]
+}
+
+export interface GeminiMyStuffCachePayload {
+  requestId?: string
+  items: GeminiMyStuffRecord[]
+  kinds: GeminiMyStuffKind[]
+  reason: "snapshot" | "sync"
+  timestamp: number
+}
+
+export interface WindowMessage {
+  type: string
+  payload?: any
+}

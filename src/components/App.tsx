@@ -1,0 +1,3822 @@
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react"
+
+import { getAdapter } from "~adapters/index"
+import type { SiteAdapter } from "~adapters/base"
+import { SITE_IDS } from "~constants/defaults"
+import {
+  ConversationManager,
+  type ConversationExportOptions,
+  type ConversationExportProgress,
+  type ConversationExportStage,
+  type ConversationSegmentedExportDraft,
+  type ConversationSegmentedExportMode,
+} from "~core/conversation-manager"
+import type { ExportFormat } from "~utils/exporter"
+import { InlineBookmarkManager } from "~core/inline-bookmark-manager"
+import { OutlineManager, type OutlineNode } from "~core/outline-manager"
+import { AI_STUDIO_SHORTCUT_SYNC_EVENT, PromptManager } from "~core/prompt-manager"
+import { QueueDispatcher } from "~core/queue-dispatcher"
+import { QuickQuoteActions } from "~components/QuickQuoteActions"
+import { ensureGlobalThemeManager, type ThemeTransitionOrigin } from "~core/theme-manager"
+import { useEdgePeekController } from "~hooks/useEdgePeekController"
+import { useShortcuts } from "~hooks/useShortcuts"
+import { platform } from "~platform"
+import {
+  getFullChangelogUrl,
+  getReleaseNotesMarkdown,
+  hasCurrentReleaseNotes,
+} from "~release-notes"
+import { currentReleaseNotes } from "~release-notes/current"
+import {
+  getReleaseNotesState,
+  markReleaseNotesSeen,
+  markReleaseNotesToastShown,
+} from "~release-notes/storage"
+import { useSettingsHydrated, useSettingsStore } from "~stores/settings-store"
+import { useConversationsStore } from "~stores/conversations-store"
+import { useFoldersStore } from "~stores/folders-store"
+import { usePromptsStore } from "~stores/prompts-store"
+import { APP_DISPLAY_NAME, APP_VERSION } from "~utils/config"
+import { DEFAULT_SETTINGS, getSiteTheme, type Prompt } from "~utils/storage"
+import {
+  EVENT_EXTENSION_UPDATE_AVAILABLE,
+  EVENT_PAGE_URL_CHANGE,
+  MSG_CLEAR_ALL_DATA,
+} from "~utils/messaging"
+import { showToast } from "~utils/toast"
+import { setLanguage, t } from "~utils/i18n"
+import { getHighlightStyles, renderMarkdown } from "~utils/markdown"
+import { createSafeHTML } from "~utils/trusted-types"
+import { initCopyButtons, showCopySuccess } from "~utils/icons"
+import { hasOphelInteractionLayer } from "~utils/dom-toolkit"
+import { isLikelyMobileDevice } from "~utils/device"
+
+import { ConfirmDialog, FolderSelectDialog, TagManagerDialog } from "./ConversationDialogs"
+import { DisclaimerModal } from "./DisclaimerModal"
+import { LoadingOverlay } from "./LoadingOverlay"
+import { MainPanel } from "./MainPanel"
+import { QueueOverlay } from "./QueueOverlay"
+import { ReleaseNotesModal } from "./ReleaseNotesModal"
+import { QuickButtons } from "./QuickButtons"
+import { SelectedPromptBar } from "./SelectedPromptBar"
+import { ExportDialog } from "./ExportDialog"
+import { SegmentedExportDialog } from "./SegmentedExportDialog"
+import { SettingsModal } from "./SettingsModal"
+import { GlobalSearchOverlay } from "./global-search/GlobalSearchOverlay"
+import { GlobalSearchResultItemView } from "./global-search/GlobalSearchResultItemView"
+import {
+  GLOBAL_SEARCH_ALL_CATEGORY_ITEM_LIMIT,
+  GLOBAL_SEARCH_CATEGORY_DEFINITIONS,
+  GLOBAL_SEARCH_FILTER_CHIP_MAX_COUNT,
+  GLOBAL_SEARCH_KEYBOARD_SAFE_BOTTOM,
+  GLOBAL_SEARCH_KEYBOARD_SAFE_TOP,
+  GLOBAL_SEARCH_MATCH_REASON_LABEL_DEFINITIONS,
+  GLOBAL_SEARCH_OPTION_ID_PREFIX,
+  GLOBAL_SEARCH_PROMPT_PREVIEW_HIDE_DELAY_MS,
+  GLOBAL_SEARCH_PROMPT_PREVIEW_KEYBOARD_DELAY_MS,
+  GLOBAL_SEARCH_PROMPT_PREVIEW_POINTER_DELAY_MS,
+  GLOBAL_SEARCH_RESULTS_LISTBOX_ID,
+  GLOBAL_SEARCH_RESULT_CATEGORY_LABELS,
+  GLOBAL_SEARCH_SYNTAX_SUGGESTION_LIMIT,
+} from "./global-search/constants"
+import {
+  useGlobalSearchController,
+  useGlobalSearchControllerKeyboard,
+} from "./global-search/useGlobalSearchController"
+import { useGlobalSearchSyntax } from "./global-search/useGlobalSearchSyntax"
+import type {
+  GlobalSearchCategoryId,
+  GlobalSearchMatchReason,
+  GlobalSearchResultCategory,
+  GlobalSearchResultItem,
+  GlobalSearchSyntaxSuggestionItem,
+} from "./global-search/types"
+import { useGlobalSearchData } from "./global-search/useGlobalSearchData"
+import {
+  MODEL_LOCK_SETTINGS_SEARCH_ITEMS,
+  MODEL_LOCK_SITE_LABEL_DEFINITIONS,
+  SETTING_SEARCH_PAGE_LABEL_DEFINITIONS,
+  SETTING_SEARCH_SUB_TAB_LABEL_DEFINITIONS,
+  SETTING_SEARCH_TITLE_KEY_MAP,
+  toSearchTitleFallback,
+} from "./global-search/settingsSearch"
+import {
+  getGlobalSearchTrailingTokenInfo,
+  parseGlobalSearchQuery,
+  stringifyGlobalSearchQuery,
+  toGlobalSearchTokens,
+} from "./global-search/syntax"
+import { useTagsStore } from "~stores/tags-store"
+import {
+  TAB_IDS,
+  resolveSettingRoute,
+  searchSettingsItems,
+  type SettingsSearchItem,
+} from "~constants"
+import {
+  DEFAULT_KEYBINDINGS,
+  formatShortcut,
+  normalizeShortcutsSettings,
+  SHORTCUT_ACTIONS,
+  SHORTCUT_META,
+  type ShortcutActionId,
+} from "~constants/shortcuts"
+
+interface LocalizedLabelDefinition {
+  key: string
+  fallback: string
+}
+
+interface LauncherPeekAnchorRect {
+  left: number
+  right: number
+  top: number
+  bottom: number
+  width: number
+  height: number
+}
+
+interface PointerPosition {
+  clientX: number
+  clientY: number
+}
+
+const LAUNCHER_PEEK_DWELL_MS = 300
+const LAUNCHER_PEEK_HIDE_DELAY_MS = 250
+const EDGE_HOVER_ZONE_DWELL_MS = 150
+
+const EXPORT_STAGE_TEXT_KEYS: Record<ConversationExportStage, string> = {
+  "loading-history": "exportOverlayLoadingHistory",
+  preparing: "exportOverlayPreparing",
+  extracting: "exportOverlayExtracting",
+  packaging: "exportOverlayPackaging",
+  downloading: "exportOverlayDownloading",
+  copying: "exportOverlayCopying",
+  restoring: "exportOverlayRestoring",
+}
+
+const OUTLINE_COPY_STAGE_TEXT_KEYS: Record<ConversationExportStage, string> = {
+  "loading-history": "outlineCopyOverlayLoadingHistory",
+  preparing: "outlineCopyOverlayPreparing",
+  extracting: "outlineCopyOverlayExtracting",
+  packaging: "exportOverlayPackaging",
+  downloading: "exportOverlayDownloading",
+  copying: "outlineCopyOverlayCopying",
+  restoring: "outlineCopyOverlayRestoring",
+}
+
+type GlobalSearchOpenSource = "shortcut" | "ui" | "event"
+
+const isLikelyMacPlatform = () => {
+  if (typeof navigator === "undefined") return false
+  const platform = navigator.platform?.toLowerCase?.() || ""
+  const userAgent = navigator.userAgent?.toLowerCase?.() || ""
+  return platform.includes("mac") || userAgent.includes("mac os")
+}
+
+const PASS_THROUGH_META_KEY_ALIASES = new Set(["Meta", "OS", "Command", "Cmd"])
+const PASS_THROUGH_CONTROL_KEY_ALIASES = new Set(["Control", "Ctrl"])
+
+const hasPromptVariables = (content: string): boolean => /\{\{([^\s{}]+)\}\}/.test(content)
+
+export interface AppProps {
+  adapter?: SiteAdapter | null
+}
+
+export const App: React.FC<AppProps> = ({ adapter: propAdapter }) => {
+  // 读取设置 - 使用 Zustand Store
+  const { settings, setSettings, updateDeepSetting, updateNestedSetting } = useSettingsStore()
+  const isSettingsHydrated = useSettingsHydrated()
+  const promptSubmitShortcut = settings?.features?.prompts?.submitShortcut ?? "enter"
+
+  // 订阅 _syncVersion 以在跨上下文同步时强制触发重渲染。
+  useSettingsStore((s) => s._syncVersion)
+  const [i18nRenderTick, setI18nRenderTick] = useState(0)
+
+  const getLocalizedText = useCallback(
+    (definition: LocalizedLabelDefinition) => {
+      void i18nRenderTick
+      const translated = t(definition.key)
+      return translated === definition.key ? definition.fallback : translated
+    },
+    [i18nRenderTick],
+  )
+
+  const formatLocalizedText = useCallback(
+    (definition: LocalizedLabelDefinition, params: Record<string, string>) => {
+      let text = getLocalizedText(definition)
+
+      Object.keys(params).forEach((paramKey) => {
+        text = text.replace(new RegExp(`{${paramKey}}`, "g"), params[paramKey])
+      })
+
+      return text
+    },
+    [getLocalizedText],
+  )
+
+  const isMacLike = useMemo(() => isLikelyMacPlatform(), [])
+  const resolvedShortcutSettings = useMemo(
+    () => normalizeShortcutsSettings(settings?.shortcuts) || DEFAULT_SETTINGS.shortcuts,
+    [settings?.shortcuts],
+  )
+  const globalSearchPrimaryBinding = useMemo(() => {
+    if (!resolvedShortcutSettings.enabled) {
+      return null
+    }
+
+    const userBinding = resolvedShortcutSettings.keybindings[SHORTCUT_ACTIONS.OPEN_GLOBAL_SEARCH]
+    if (userBinding === null) {
+      return null
+    }
+    return userBinding || DEFAULT_KEYBINDINGS[SHORTCUT_ACTIONS.OPEN_GLOBAL_SEARCH]
+  }, [resolvedShortcutSettings])
+  const globalSearchPrimaryShortcutLabel = globalSearchPrimaryBinding
+    ? formatShortcut(globalSearchPrimaryBinding, isMacLike)
+    : ""
+  const isDoubleShiftSearchShortcutEnabled =
+    settings?.globalSearch?.doubleShift ?? DEFAULT_SETTINGS.globalSearch.doubleShift
+  const globalSearchShortcutHintLabel = useMemo(() => {
+    const labels: string[] = []
+
+    if (globalSearchPrimaryShortcutLabel) {
+      labels.push(globalSearchPrimaryShortcutLabel)
+    }
+    if (isDoubleShiftSearchShortcutEnabled) {
+      labels.push("double shift")
+    }
+
+    return labels.join(" / ")
+  }, [globalSearchPrimaryShortcutLabel, isDoubleShiftSearchShortcutEnabled])
+  const passThroughModifierLabel = isMacLike ? "⌘" : "Ctrl"
+  const resolveShortcutLabel = useCallback(
+    (actionId: ShortcutActionId): string | null => {
+      if (actionId === SHORTCUT_ACTIONS.OPEN_GLOBAL_SEARCH) {
+        return globalSearchShortcutHintLabel || null
+      }
+
+      if (!resolvedShortcutSettings.enabled) {
+        return null
+      }
+
+      const binding = resolvedShortcutSettings.keybindings[actionId]
+      if (binding === null) {
+        return null
+      }
+
+      const resolvedBinding = binding || DEFAULT_KEYBINDINGS[actionId]
+      return resolvedBinding ? formatShortcut(resolvedBinding, isMacLike) : null
+    },
+    [globalSearchShortcutHintLabel, isMacLike, resolvedShortcutSettings],
+  )
+  const globalSearchOverlayHotkeyLabel = globalSearchShortcutHintLabel || t("shortcutNotSet")
+  const isGlobalSearchFuzzySearchEnabled =
+    settings?.globalSearch?.enableFuzzySearch ?? DEFAULT_SETTINGS.globalSearch.enableFuzzySearch
+
+  const globalSearchShortcutNudgeText = useMemo(() => {
+    if (!globalSearchShortcutHintLabel) {
+      return ""
+    }
+
+    return formatLocalizedText(
+      {
+        key: "globalSearchShortcutNudge",
+        fallback: "下次可按 {shortcut} 快速打开",
+      },
+      {
+        shortcut: globalSearchShortcutHintLabel,
+      },
+    )
+  }, [formatLocalizedText, globalSearchShortcutHintLabel])
+
+  const handleGlobalSearchPromptPreviewClick = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      event.stopPropagation()
+
+      const target = event.target as HTMLElement
+      const copyButton = target.closest(".gh-code-copy-btn") as HTMLElement | null
+      if (!copyButton) {
+        return
+      }
+
+      const code = copyButton.nextElementSibling?.textContent || ""
+      if (!code) {
+        return
+      }
+
+      if (!navigator.clipboard?.writeText) {
+        showToast(getLocalizedText({ key: "copyFailed", fallback: "Copy failed" }))
+        return
+      }
+
+      void navigator.clipboard
+        .writeText(code)
+        .then(() => {
+          showCopySuccess(copyButton, { size: 14 })
+        })
+        .catch(() => {
+          showToast(getLocalizedText({ key: "copyFailed", fallback: "Copy failed" }))
+        })
+    },
+    [getLocalizedText],
+  )
+
+  const toggleGlobalSearchFuzzySearch = useCallback(() => {
+    setSettings({
+      globalSearch: {
+        ...DEFAULT_SETTINGS.globalSearch,
+        ...(settings?.globalSearch || {}),
+        enableFuzzySearch: !isGlobalSearchFuzzySearchEnabled,
+      },
+    })
+  }, [isGlobalSearchFuzzySearchEnabled, setSettings, settings?.globalSearch])
+
+  const getPageLabel = useCallback(
+    (page: string) => {
+      const definition = SETTING_SEARCH_PAGE_LABEL_DEFINITIONS[page]
+      if (!definition) return page
+      return getLocalizedText(definition)
+    },
+    [getLocalizedText],
+  )
+
+  const getSubTabLabel = useCallback(
+    (subTab: string) => {
+      const definition = SETTING_SEARCH_SUB_TAB_LABEL_DEFINITIONS[subTab]
+      if (!definition) return subTab
+      return getLocalizedText(definition)
+    },
+    [getLocalizedText],
+  )
+
+  const resolveSettingSearchTitle = useCallback(
+    (item: SettingsSearchItem): string => {
+      const titleKey = SETTING_SEARCH_TITLE_KEY_MAP[item.settingId]
+      if (titleKey) {
+        return getLocalizedText({
+          key: titleKey,
+          fallback: toSearchTitleFallback(item.settingId),
+        })
+      }
+
+      if (item.settingId.startsWith("model-lock-")) {
+        const siteKey = item.settingId.slice("model-lock-".length)
+        const siteLabelDefinition = MODEL_LOCK_SITE_LABEL_DEFINITIONS[siteKey]
+        if (siteLabelDefinition) {
+          const modelLockLabel = getLocalizedText({ key: "tabModelLock", fallback: "Model Lock" })
+          const siteLabel = getLocalizedText(siteLabelDefinition)
+          return `${modelLockLabel}: ${siteLabel}`
+        }
+      }
+
+      if (item.settingId.startsWith("shortcut-binding-")) {
+        const actionId = item.settingId.slice("shortcut-binding-".length)
+        const shortcutMeta = SHORTCUT_META[actionId as keyof typeof SHORTCUT_META]
+        if (shortcutMeta) {
+          const shortcutsLabel = getLocalizedText({
+            key: "navShortcuts",
+            fallback: "Keyboard Shortcuts",
+          })
+          const actionLabel = getLocalizedText({
+            key: shortcutMeta.labelKey,
+            fallback: shortcutMeta.label,
+          })
+          return `${shortcutsLabel}: ${actionLabel}`
+        }
+      }
+
+      return toSearchTitleFallback(item.settingId)
+    },
+    [getLocalizedText],
+  )
+
+  const getSettingsBreadcrumb = useCallback(
+    (settingId: string): string => {
+      const route = resolveSettingRoute(settingId)
+      if (!route) {
+        return getLocalizedText({ key: "globalSearchCategorySettings", fallback: "Settings" })
+      }
+
+      const pageLabel = getPageLabel(route.page)
+      if (!route.subTab) {
+        return pageLabel
+      }
+
+      const subTabLabel = getSubTabLabel(route.subTab)
+      return `${pageLabel} / ${subTabLabel}`
+    },
+    [getLocalizedText, getPageLabel, getSubTabLabel],
+  )
+
+  // 单例实例
+  const fallbackAdapter = useMemo(() => getAdapter(), [])
+  const adapter = propAdapter !== undefined ? propAdapter : fallbackAdapter
+  const siteInstanceKey = adapter?.getSiteInstanceKey() || "_default"
+
+  const promptManager = useMemo(() => {
+    return adapter ? new PromptManager(adapter) : null
+  }, [adapter])
+
+  const queueDispatcher = useMemo(() => {
+    return adapter && promptManager ? new QueueDispatcher(adapter, promptManager) : null
+  }, [adapter, promptManager])
+
+  // QueueDispatcher lifecycle
+  useEffect(() => {
+    if (!queueDispatcher) return
+    const isQueueEnabled = settings?.features?.prompts?.promptQueue ?? false
+    if (isQueueEnabled) {
+      queueDispatcher.start()
+    } else {
+      queueDispatcher.stop()
+    }
+    return () => queueDispatcher.stop()
+  }, [queueDispatcher, settings?.features?.prompts?.promptQueue])
+
+  const conversationManager = useMemo(() => {
+    return adapter ? new ConversationManager(adapter) : null
+  }, [adapter])
+  const [exportProgress, setExportProgress] = useState<ConversationExportProgress | null>(null)
+
+  useEffect(() => {
+    if (!conversationManager) {
+      setExportProgress(null)
+      return
+    }
+
+    setExportProgress(null)
+    return conversationManager.onExportProgress(setExportProgress)
+  }, [conversationManager])
+
+  const outlineManager = useMemo(() => {
+    if (!adapter) return null
+
+    // 使用 Zustand 的 updateDeepSetting
+    const handleExpandLevelChange = (level: number) => {
+      updateDeepSetting("features", "outline", "expandLevel", level)
+    }
+
+    const handleShowUserQueriesChange = (show: boolean) => {
+      updateDeepSetting("features", "outline", "showUserQueries", show)
+    }
+
+    return new OutlineManager(
+      adapter,
+      settings?.features?.outline ?? DEFAULT_SETTINGS.features.outline,
+      handleExpandLevelChange,
+      handleShowUserQueriesChange,
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在 adapter 变化时重新创建
+  }, [adapter, updateDeepSetting])
+
+  // 面板展开状态：true 表示面板没有收进快捷按钮组，和悬浮/吸附模式无关
+  const [isPanelExpanded, setIsPanelExpandedState] = useState(false)
+  const isPanelExpandedRef = useRef(false)
+
+  const setPanelExpandedState = useCallback((expanded: boolean) => {
+    isPanelExpandedRef.current = expanded
+    setIsPanelExpandedState(expanded)
+  }, [])
+
+  const persistPanelExpanded = useCallback(
+    (expanded: boolean) => {
+      setPanelExpandedState(expanded)
+      updateNestedSetting("panel", "panelExpanded", expanded)
+    },
+    [setPanelExpandedState, updateNestedSetting],
+  )
+
+  // 使用 ref 保持 settings 的最新引用，避免闭包捕获过期值
+  const settingsRef = useRef(settings)
+  useEffect(() => {
+    settingsRef.current = settings
+  }, [settings])
+
+  // 初始化面板状态
+  useEffect(() => {
+    // 确保仅在 hydration 完成且 settings 加载后执行一次初始化
+    if (isSettingsHydrated && settings && !isInitializedRef.current) {
+      isInitializedRef.current = true
+      const panelMode = settings.panel?.panelMode ?? "floating"
+      const defaultPosition = settings.panel?.defaultPosition ?? "right"
+
+      setPanelExpandedState(settings.panel?.panelExpanded ?? true)
+
+      if (panelMode === "edge-snap") {
+        setEdgeSnapState(defaultPosition)
+      } else {
+        setEdgeSnapState(null)
+      }
+    }
+  }, [isSettingsHydrated, setPanelExpandedState, settings])
+
+  // 外部恢复/同步设置时，只跟随新的统一展开字段，不再从模式推导展开状态
+  useEffect(() => {
+    if (!isInitializedRef.current || !settings) return
+    const panelExpanded = settings.panel?.panelExpanded ?? true
+    if (panelExpanded !== isPanelExpandedRef.current) {
+      setPanelExpandedState(panelExpanded)
+    }
+  }, [setPanelExpandedState, settings])
+
+  // 全局防遮挡状态 (防遮挡体验升级)
+  const [isPassThrough, setIsPassThrough] = useState(false)
+  const pressedKeys = useRef<Set<string>>(new Set())
+  const passThroughTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    const PASS_THROUGH_HOLD_MS = 200
+    const passThroughModifierKey = isMacLike ? "Meta" : "Control"
+    const passThroughModifierKeyAliases = isMacLike
+      ? PASS_THROUGH_META_KEY_ALIASES
+      : PASS_THROUGH_CONTROL_KEY_ALIASES
+
+    const normalizePassThroughKey = (key: string) => {
+      if (PASS_THROUGH_META_KEY_ALIASES.has(key)) return "Meta"
+      if (PASS_THROUGH_CONTROL_KEY_ALIASES.has(key)) return "Control"
+      return key
+    }
+
+    const hasUnexpectedPassThroughModifier = (event?: KeyboardEvent) => {
+      if (!event) return false
+
+      return isMacLike
+        ? event.ctrlKey || event.altKey || event.shiftKey
+        : event.metaKey || event.altKey || event.shiftKey
+    }
+
+    const hasOnlyPassThroughModifierKeys = () => {
+      const keys = Array.from(pressedKeys.current)
+      return keys.length > 0 && keys.every((key) => passThroughModifierKeyAliases.has(key))
+    }
+
+    const clearPassThroughTimer = () => {
+      if (passThroughTimerRef.current !== null) {
+        window.clearTimeout(passThroughTimerRef.current)
+        passThroughTimerRef.current = null
+      }
+    }
+
+    const checkPassThrough = (event?: KeyboardEvent) => {
+      const hasPassThroughModifier = event
+        ? isMacLike
+          ? event.metaKey || passThroughModifierKeyAliases.has(normalizePassThroughKey(event.key))
+          : event.ctrlKey || passThroughModifierKeyAliases.has(normalizePassThroughKey(event.key))
+        : pressedKeys.current.has(passThroughModifierKey)
+
+      // 平台限定：Windows/Linux 仅保留 Ctrl，macOS 仅保留 Command，避免浏览器级 Alt 焦点劫持。
+      const shouldPassThrough =
+        hasPassThroughModifier &&
+        hasOnlyPassThroughModifierKeys() &&
+        !hasUnexpectedPassThroughModifier(event)
+
+      if (!shouldPassThrough) {
+        clearPassThroughTimer()
+        setIsPassThrough(false)
+        return
+      }
+
+      if (isPassThrough || passThroughTimerRef.current !== null) {
+        return
+      }
+
+      passThroughTimerRef.current = window.setTimeout(() => {
+        passThroughTimerRef.current = null
+        if (hasOnlyPassThroughModifierKeys() && pressedKeys.current.has(passThroughModifierKey)) {
+          setIsPassThrough(true)
+        }
+      }, PASS_THROUGH_HOLD_MS)
+    }
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const normalizedKey = normalizePassThroughKey(e.key)
+
+      // macOS 上 Command 参与快捷键时，非修饰键的 keyup 可能被浏览器吞掉。
+      // 在新的主修饰键按下时清掉残留键，避免透明隐藏状态被旧按键卡住。
+      if (normalizedKey === passThroughModifierKey && !hasUnexpectedPassThroughModifier(e)) {
+        pressedKeys.current.clear()
+      }
+
+      pressedKeys.current.add(normalizedKey)
+      checkPassThrough(e)
+    }
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      pressedKeys.current.delete(normalizePassThroughKey(e.key))
+      checkPassThrough(e)
+    }
+
+    const handleBlur = () => {
+      pressedKeys.current.clear()
+      checkPassThrough()
+    }
+
+    window.addEventListener("keydown", handleKeyDown, true)
+    window.addEventListener("keyup", handleKeyUp, true)
+    window.addEventListener("blur", handleBlur)
+
+    return () => {
+      clearPassThroughTimer()
+      window.removeEventListener("keydown", handleKeyDown, true)
+      window.removeEventListener("keyup", handleKeyUp, true)
+      window.removeEventListener("blur", handleBlur)
+    }
+  }, [isMacLike, isPassThrough])
+
+  // 选中的提示词状态
+  const [selectedPrompt, setSelectedPrompt] = useState<Prompt | null>(null)
+
+  // 设置模态框状态
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [isHoverWidthSettingsPreviewActive, setIsHoverWidthSettingsPreviewActive] = useState(false)
+  const [hoverWidthReleaseToken, setHoverWidthReleaseToken] = useState(0)
+  const [isReleaseNotesOpen, setIsReleaseNotesOpen] = useState(false)
+  const [hasUnseenReleaseNotes, setHasUnseenReleaseNotes] = useState(false)
+  const [showReleaseNotesToast, setShowReleaseNotesToast] = useState(false)
+  const [showExtensionUpdateNotice, setShowExtensionUpdateNotice] = useState(
+    () => typeof window !== "undefined" && Boolean(window.__OPHEL_EXTENSION_UPDATE_AVAILABLE__),
+  )
+  const [extensionUpdateVersion, setExtensionUpdateVersion] = useState<string | null>(() =>
+    typeof window !== "undefined" ? window.__OPHEL_PENDING_UPDATE_VERSION__ || null : null,
+  )
+  const settingsSearchInputRef = useRef<HTMLInputElement | null>(null)
+  const globalSearchSyntaxHelpTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const globalSearchSyntaxHelpPopoverRef = useRef<HTMLDivElement | null>(null)
+  const settingsSearchResultsRef = useRef<HTMLDivElement | null>(null)
+  const promptPreviewContainerRef = useRef<HTMLDivElement | null>(null)
+  const globalSearchController = useGlobalSearchController({
+    shortcutNudgeText: globalSearchShortcutNudgeText,
+    settingsSearchResultsRef,
+    promptPreviewPointerDelayMs: GLOBAL_SEARCH_PROMPT_PREVIEW_POINTER_DELAY_MS,
+    promptPreviewHideDelayMs: GLOBAL_SEARCH_PROMPT_PREVIEW_HIDE_DELAY_MS,
+  })
+  const {
+    isGlobalSettingsSearchOpen,
+    setIsGlobalSettingsSearchOpen,
+    showGlobalSearchSyntaxHelp,
+    setShowGlobalSearchSyntaxHelp,
+    activeSearchSyntaxSuggestionIndex,
+    setActiveSearchSyntaxSuggestionIndex,
+    showGlobalSearchShortcutNudge,
+    globalSearchShortcutNudgeMessage,
+    hideGlobalSearchShortcutNudge,
+    dismissGlobalSearchShortcutNudgeForever,
+    markGlobalSearchShortcutUsed,
+    tryShowGlobalSearchShortcutNudge,
+    settingsSearchInputValue,
+    setSettingsSearchInputValue,
+    settingsSearchQuery,
+    setSettingsSearchQuery,
+    clearSettingsSearchInputDebounceTimer,
+    syncSettingsSearchInputAndQuery,
+    commitSettingsSearchInputValue,
+    activeGlobalSearchCategory,
+    setActiveGlobalSearchCategory,
+    settingsSearchActiveIndex,
+    setSettingsSearchActiveIndex,
+    settingsSearchHoverLocked,
+    setSettingsSearchHoverLocked,
+    settingsSearchNavigationMode,
+    setSettingsSearchNavigationMode,
+    expandedGlobalSearchCategories,
+    setExpandedGlobalSearchCategories,
+    globalSearchPromptPreview,
+    globalSearchPromptPreviewPosition,
+    clearPromptPreviewTimer,
+    clearPromptPreviewHideTimer,
+    hideGlobalSearchPromptPreview,
+    scheduleHideGlobalSearchPromptPreview,
+    scheduleGlobalSearchPromptPreview,
+    scheduleGlobalSearchPointerPreview,
+    refreshGlobalSearchPromptPreviewAnchorRect,
+  } = globalSearchController
+
+  const syncGlobalSearchValueAndCategory = useCallback(
+    (nextValue: string) => {
+      const normalizedValue = nextValue.trimStart()
+
+      syncSettingsSearchInputAndQuery(nextValue)
+
+      setActiveGlobalSearchCategory((previousCategory) => {
+        if (normalizedValue.startsWith("tip:")) {
+          return previousCategory === "tips" ? previousCategory : "tips"
+        }
+
+        return previousCategory === "tips" ? "all" : previousCategory
+      })
+    },
+    [setActiveGlobalSearchCategory, syncSettingsSearchInputAndQuery],
+  )
+
+  const settingsSearchWheelFreezeUntilRef = useRef(0)
+  const globalSearchOpenSourceRef = useRef<GlobalSearchOpenSource>("ui")
+  const lastShiftPressedAtRef = useRef(0)
+  const [outlineSearchVersion, setOutlineSearchVersion] = useState(0)
+  const outlineSearchNavigationRequestIdRef = useRef(0)
+  const settingsSearchRestoreFocusRef = useRef<HTMLElement | null>(null)
+  const releaseNotesLanguage = settings?.language ?? DEFAULT_SETTINGS.language
+  const canShowCurrentReleaseNotes = hasCurrentReleaseNotes()
+  const releaseNotesMarkdown = canShowCurrentReleaseNotes
+    ? getReleaseNotesMarkdown(releaseNotesLanguage)
+    : ""
+  const fullChangelogUrl = canShowCurrentReleaseNotes
+    ? getFullChangelogUrl(releaseNotesLanguage)
+    : "https://ophel.app/docs/changelog"
+
+  // 红点悬停 popover 与更新 toast 共用的标题和首条要点预览
+  const releaseNotesTitleText = canShowCurrentReleaseNotes
+    ? formatLocalizedText(
+        { key: "releaseNotesTitle", fallback: `Ophel Atlas v{version}` },
+        { version: APP_VERSION },
+      )
+    : ""
+
+  const releaseNotesPreview = useMemo(() => {
+    const firstItem = releaseNotesMarkdown
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("- "))
+    if (!firstItem) return ""
+    // 去掉 markdown 加粗标记与末尾的 PR/issue 引用，popover/toast 里只留纯文本
+    return firstItem
+      .slice(2)
+      .replace(/\*\*/g, "")
+      .replace(/\s*\((?:#[\d]+[@\w.,\s#]*)\)\s*$/, "")
+      .trim()
+  }, [releaseNotesMarkdown])
+
+  const markCurrentReleaseNotesSeen = useCallback(() => {
+    setHasUnseenReleaseNotes(false)
+    void markReleaseNotesSeen(APP_VERSION).catch((error) => {
+      console.warn("[Ophel] Failed to save release notes state:", error)
+    })
+  }, [])
+
+  const openReleaseNotes = useCallback(() => {
+    if (!canShowCurrentReleaseNotes || !releaseNotesMarkdown.trim()) return
+    // 无论从哪个入口打开更新日志，都同时收起 toast，避免浮层叠在 modal 之上
+    setShowReleaseNotesToast(false)
+    setIsReleaseNotesOpen(true)
+  }, [canShowCurrentReleaseNotes, releaseNotesMarkdown])
+
+  const closeReleaseNotes = useCallback(() => {
+    setIsReleaseNotesOpen(false)
+    markCurrentReleaseNotesSeen()
+  }, [markCurrentReleaseNotesSeen])
+
+  const openFullChangelog = useCallback(() => {
+    platform.openTab(fullChangelogUrl)
+  }, [fullChangelogUrl])
+
+  const dismissReleaseNotesToast = useCallback(() => {
+    setShowReleaseNotesToast(false)
+    void markReleaseNotesToastShown(APP_VERSION).catch((error) => {
+      console.warn("[Ophel] Failed to save release notes toast state:", error)
+    })
+  }, [])
+
+  const openReleaseNotesFromToast = useCallback(() => {
+    openReleaseNotes()
+    dismissReleaseNotesToast()
+  }, [openReleaseNotes, dismissReleaseNotesToast])
+
+  // toast 自动消失；悬停时暂停计时，移开后重新计时
+  const releaseNotesToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearReleaseNotesToastTimer = useCallback(() => {
+    if (releaseNotesToastTimerRef.current) {
+      clearTimeout(releaseNotesToastTimerRef.current)
+      releaseNotesToastTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!showReleaseNotesToast) return
+    releaseNotesToastTimerRef.current = setTimeout(dismissReleaseNotesToast, 8000)
+    return clearReleaseNotesToastTimer
+  }, [showReleaseNotesToast, dismissReleaseNotesToast, clearReleaseNotesToastTimer])
+
+  const pauseReleaseNotesToast = useCallback(() => {
+    clearReleaseNotesToastTimer()
+  }, [clearReleaseNotesToastTimer])
+
+  const resumeReleaseNotesToast = useCallback(() => {
+    clearReleaseNotesToastTimer()
+    releaseNotesToastTimerRef.current = setTimeout(dismissReleaseNotesToast, 4000)
+  }, [clearReleaseNotesToastTimer, dismissReleaseNotesToast])
+
+  useEffect(() => {
+    if (
+      !canShowCurrentReleaseNotes ||
+      !releaseNotesMarkdown.trim() ||
+      !isSettingsHydrated ||
+      !settings?.hasAgreedToTerms ||
+      // 与右下角扩展更新横幅错开，避免两个浮层同位置重叠
+      showExtensionUpdateNotice ||
+      // 更新日志已打开时不再弹 toast；关闭后已读标记会让本 effect 不再调度
+      isReleaseNotesOpen
+    ) {
+      return
+    }
+
+    let cancelled = false
+    let toastDelayTimer: ReturnType<typeof setTimeout> | null = null
+
+    void getReleaseNotesState()
+      .then((state) => {
+        if (cancelled) return
+        const unseen = state.lastSeenVersion !== APP_VERSION
+        setHasUnseenReleaseNotes(unseen)
+
+        // 更新提醒 toast 每个版本最多一次，且只在升级场景（有历史版本记录）触发，
+        // 首次安装走红点即可，避免和免责流程叠加打扰
+        if (unseen && state.lastSeenVersion && state.lastToastVersion !== APP_VERSION) {
+          toastDelayTimer = setTimeout(() => {
+            if (!cancelled) setShowReleaseNotesToast(true)
+          }, 1600)
+        }
+      })
+      .catch((error) => {
+        console.warn("[Ophel] Failed to read release notes state:", error)
+      })
+
+    return () => {
+      cancelled = true
+      if (toastDelayTimer) clearTimeout(toastDelayTimer)
+    }
+  }, [
+    canShowCurrentReleaseNotes,
+    isReleaseNotesOpen,
+    isSettingsHydrated,
+    releaseNotesMarkdown,
+    settings?.hasAgreedToTerms,
+    showExtensionUpdateNotice,
+  ])
+
+  // 浮动工具栏
+
+  const [floatingToolbarMoveState, setFloatingToolbarMoveState] = useState<{
+    convId: string
+    activeFolderId?: string
+  } | null>(null)
+  const [isFloatingToolbarClearOpen, setIsFloatingToolbarClearOpen] = useState(false)
+  const [segmentedExportDraft, setSegmentedExportDraft] =
+    useState<ConversationSegmentedExportDraft | null>(null)
+  const [isSegmentedExporting, setIsSegmentedExporting] = useState(false)
+
+  // 边缘吸附状态
+  const [edgeSnapState, setEdgeSnapState] = useState<"left" | "right" | null>(null)
+  const edgeHoverZoneDwellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 使用 ref 跟踪设置模态框状态，避免闭包捕获过期值
+  const isSettingsOpenRef = useRef(false)
+  // 标记全局搜索是否由设置页切换而来（用于 Esc 返回）
+  const searchOpenedFromSettingsRef = useRef(false)
+  // 追踪是否已完成初始化，防止重复执行
+  const isInitializedRef = useRef(false)
+
+  const getEdgePeekQueryRoots = useCallback((): Array<Element | ShadowRoot> => {
+    const roots: Array<Element | ShadowRoot> = []
+    const shadowHosts = document.querySelectorAll("plasmo-csui, #ophel-userscript-root")
+
+    for (const shadowHost of shadowHosts) {
+      if (shadowHost.shadowRoot) {
+        roots.push(shadowHost.shadowRoot)
+      }
+    }
+
+    if (document.body) {
+      roots.push(document.body)
+    }
+
+    return roots
+  }, [])
+
+  const findUiElement = useCallback(
+    (selector: string): HTMLElement | null => {
+      for (const root of getEdgePeekQueryRoots()) {
+        const element = root.querySelector(selector)
+        if (element instanceof HTMLElement) {
+          return element
+        }
+      }
+
+      return null
+    },
+    [getEdgePeekQueryRoots],
+  )
+
+  const {
+    isEdgePeeking,
+    showEdgePeek,
+    hideEdgePeek,
+    scheduleEdgePeekSync,
+    showEdgePeekFromShortcut,
+    markSuppressOverlayInit,
+    markSyncAfterOpen,
+    handlePanelMouseEnter,
+    handlePanelMouseLeave,
+    handleInteractionChange,
+  } = useEdgePeekController({
+    edgeSnapState,
+    panelMode: settings?.panel?.panelMode,
+    isPanelExpanded,
+    findUiElement,
+    getQueryRoots: getEdgePeekQueryRoots,
+    isSettingsOpenRef,
+  })
+
+  const clearEdgeHoverZoneDwellTimer = useCallback(() => {
+    if (edgeHoverZoneDwellTimerRef.current) {
+      clearTimeout(edgeHoverZoneDwellTimerRef.current)
+      edgeHoverZoneDwellTimerRef.current = null
+    }
+  }, [])
+
+  const handleEdgeHoverZoneMouseEnter = useCallback(() => {
+    clearEdgeHoverZoneDwellTimer()
+
+    if (!edgeSnapState || settingsRef.current?.panel?.panelMode !== "edge-snap") {
+      return
+    }
+
+    edgeHoverZoneDwellTimerRef.current = setTimeout(() => {
+      edgeHoverZoneDwellTimerRef.current = null
+      handlePanelMouseEnter()
+    }, EDGE_HOVER_ZONE_DWELL_MS)
+  }, [clearEdgeHoverZoneDwellTimer, edgeSnapState, handlePanelMouseEnter])
+
+  const handleEdgeHoverZoneMouseLeave = useCallback(() => {
+    clearEdgeHoverZoneDwellTimer()
+    handlePanelMouseLeave()
+  }, [clearEdgeHoverZoneDwellTimer, handlePanelMouseLeave])
+
+  useEffect(() => {
+    return () => {
+      clearEdgeHoverZoneDwellTimer()
+    }
+  }, [clearEdgeHoverZoneDwellTimer])
+
+  const [isLauncherPeeking, setIsLauncherPeeking] = useState(false)
+  const [launcherPeekAnchorRect, setLauncherPeekAnchorRect] =
+    useState<LauncherPeekAnchorRect | null>(null)
+  const isLauncherPeekingRef = useRef(false)
+  const isLauncherPeekInteractionActiveRef = useRef(false)
+  const launcherPeekDwellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const launcherPeekHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastLauncherPeekPointerPositionRef = useRef<PointerPosition | null>(null)
+  const isLauncherPeekPointerStaleRef = useRef(false)
+
+  const clearLauncherPeekDwellTimer = useCallback(() => {
+    if (launcherPeekDwellTimerRef.current) {
+      clearTimeout(launcherPeekDwellTimerRef.current)
+      launcherPeekDwellTimerRef.current = null
+    }
+  }, [])
+
+  const clearLauncherPeekHideTimer = useCallback(() => {
+    if (launcherPeekHideTimerRef.current) {
+      clearTimeout(launcherPeekHideTimerRef.current)
+      launcherPeekHideTimerRef.current = null
+    }
+  }, [])
+
+  const hideLauncherPeek = useCallback(() => {
+    clearLauncherPeekDwellTimer()
+    clearLauncherPeekHideTimer()
+    isLauncherPeekingRef.current = false
+    isLauncherPeekInteractionActiveRef.current = false
+    setIsLauncherPeeking(false)
+    setLauncherPeekAnchorRect(null)
+  }, [clearLauncherPeekDwellTimer, clearLauncherPeekHideTimer])
+
+  const isLauncherPeekRetainedByPointer = useCallback(() => {
+    if (isLauncherPeekPointerStaleRef.current) {
+      return false
+    }
+
+    const retainedSelectors = [".gh-main-panel", ".quick-prompt-btn.panel-btn"]
+    const pointerPosition = lastLauncherPeekPointerPositionRef.current
+
+    for (const selector of retainedSelectors) {
+      const element = findUiElement(selector)
+      if (!element) {
+        continue
+      }
+
+      if (pointerPosition) {
+        const rect = element.getBoundingClientRect()
+        if (
+          pointerPosition.clientX >= rect.left &&
+          pointerPosition.clientX <= rect.right &&
+          pointerPosition.clientY >= rect.top &&
+          pointerPosition.clientY <= rect.bottom
+        ) {
+          return true
+        }
+        continue
+      }
+
+      if (element.matches(":hover")) {
+        return true
+      }
+    }
+
+    return false
+  }, [findUiElement])
+
+  const scheduleLauncherPeekHide = useCallback(() => {
+    clearLauncherPeekDwellTimer()
+    clearLauncherPeekHideTimer()
+    const runHideCheck = () => {
+      launcherPeekHideTimerRef.current = null
+
+      if (!isLauncherPeekingRef.current) {
+        return
+      }
+
+      if (
+        isLauncherPeekInteractionActiveRef.current ||
+        hasOphelInteractionLayer(getEdgePeekQueryRoots())
+      ) {
+        launcherPeekHideTimerRef.current = setTimeout(runHideCheck, LAUNCHER_PEEK_HIDE_DELAY_MS)
+        return
+      }
+
+      if (isLauncherPeekRetainedByPointer()) {
+        launcherPeekHideTimerRef.current = setTimeout(runHideCheck, LAUNCHER_PEEK_HIDE_DELAY_MS)
+        return
+      }
+
+      isLauncherPeekingRef.current = false
+      setIsLauncherPeeking(false)
+      setLauncherPeekAnchorRect(null)
+    }
+
+    launcherPeekHideTimerRef.current = setTimeout(runHideCheck, LAUNCHER_PEEK_HIDE_DELAY_MS)
+  }, [
+    clearLauncherPeekDwellTimer,
+    clearLauncherPeekHideTimer,
+    getEdgePeekQueryRoots,
+    isLauncherPeekRetainedByPointer,
+  ])
+
+  const handlePanelInteractionChange = useCallback(
+    (isActive: boolean) => {
+      handleInteractionChange(isActive)
+      isLauncherPeekInteractionActiveRef.current = isActive
+
+      if (!isLauncherPeekingRef.current) {
+        return
+      }
+
+      if (isActive) {
+        clearLauncherPeekHideTimer()
+        return
+      }
+
+      scheduleLauncherPeekHide()
+    },
+    [clearLauncherPeekHideTimer, handleInteractionChange, scheduleLauncherPeekHide],
+  )
+
+  const handlePanelLogoHoverStart = useCallback(
+    (anchorRect: DOMRect, options?: { waitForGroupDwell?: boolean }) => {
+      if (isPanelExpandedRef.current) return
+
+      isLauncherPeekPointerStaleRef.current = false
+      clearLauncherPeekDwellTimer()
+      clearLauncherPeekHideTimer()
+
+      const nextAnchorRect: LauncherPeekAnchorRect = {
+        left: anchorRect.left,
+        right: anchorRect.right,
+        top: anchorRect.top,
+        bottom: anchorRect.bottom,
+        width: anchorRect.width,
+        height: anchorRect.height,
+      }
+
+      setLauncherPeekAnchorRect(nextAnchorRect)
+      if (isLauncherPeekingRef.current) {
+        return
+      }
+
+      const dwellMs =
+        LAUNCHER_PEEK_DWELL_MS + (options?.waitForGroupDwell ? LAUNCHER_PEEK_DWELL_MS : 0)
+
+      launcherPeekDwellTimerRef.current = setTimeout(() => {
+        launcherPeekDwellTimerRef.current = null
+        if (isPanelExpandedRef.current) return
+        setLauncherPeekAnchorRect(nextAnchorRect)
+        isLauncherPeekingRef.current = true
+        setIsLauncherPeeking(true)
+      }, dwellMs)
+    },
+    [clearLauncherPeekDwellTimer, clearLauncherPeekHideTimer],
+  )
+
+  const handlePanelLogoHoverEnd = useCallback(() => {
+    if (!isLauncherPeekingRef.current) {
+      clearLauncherPeekDwellTimer()
+      return
+    }
+
+    scheduleLauncherPeekHide()
+  }, [clearLauncherPeekDwellTimer, scheduleLauncherPeekHide])
+
+  const handleMainPanelMouseEnter = useCallback(
+    (_event: React.MouseEvent<HTMLDivElement>) => {
+      if (isLauncherPeekingRef.current) {
+        clearLauncherPeekDwellTimer()
+        clearLauncherPeekHideTimer()
+        return
+      }
+
+      handlePanelMouseEnter()
+    },
+    [clearLauncherPeekDwellTimer, clearLauncherPeekHideTimer, handlePanelMouseEnter],
+  )
+
+  const handleMainPanelMouseLeave = useCallback(
+    (_event: React.MouseEvent<HTMLDivElement>) => {
+      if (isLauncherPeekingRef.current) {
+        scheduleLauncherPeekHide()
+        return
+      }
+
+      handlePanelMouseLeave()
+    },
+    [handlePanelMouseLeave, scheduleLauncherPeekHide],
+  )
+
+  useEffect(() => {
+    if (isPanelExpanded && isLauncherPeeking) {
+      hideLauncherPeek()
+    }
+  }, [hideLauncherPeek, isLauncherPeeking, isPanelExpanded])
+
+  useEffect(() => {
+    const updatePointerPosition = (event: PointerEvent) => {
+      isLauncherPeekPointerStaleRef.current = false
+      lastLauncherPeekPointerPositionRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      }
+    }
+
+    const invalidatePointerPosition = () => {
+      isLauncherPeekPointerStaleRef.current = true
+      lastLauncherPeekPointerPositionRef.current = null
+      clearLauncherPeekDwellTimer()
+
+      if (isLauncherPeekingRef.current) {
+        scheduleLauncherPeekHide()
+      }
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        invalidatePointerPosition()
+      }
+    }
+
+    const handlePointerOut = (event: PointerEvent) => {
+      if (event.relatedTarget === null) {
+        invalidatePointerPosition()
+      }
+    }
+
+    const handleMouseOut = (event: MouseEvent) => {
+      if (event.relatedTarget === null) {
+        invalidatePointerPosition()
+      }
+    }
+
+    window.addEventListener("pointermove", updatePointerPosition, true)
+    window.addEventListener("pointerdown", updatePointerPosition, true)
+    window.addEventListener("blur", invalidatePointerPosition)
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+    document.addEventListener("pointerout", handlePointerOut, true)
+    document.addEventListener("mouseout", handleMouseOut, true)
+
+    return () => {
+      window.removeEventListener("pointermove", updatePointerPosition, true)
+      window.removeEventListener("pointerdown", updatePointerPosition, true)
+      window.removeEventListener("blur", invalidatePointerPosition)
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+      document.removeEventListener("pointerout", handlePointerOut, true)
+      document.removeEventListener("mouseout", handleMouseOut, true)
+    }
+  }, [clearLauncherPeekDwellTimer, scheduleLauncherPeekHide])
+
+  useEffect(() => {
+    if (!isLauncherPeeking) {
+      return
+    }
+
+    let hadInteractionLayer = hasOphelInteractionLayer(getEdgePeekQueryRoots())
+    if (hadInteractionLayer) {
+      clearLauncherPeekHideTimer()
+    }
+
+    const handleInteractionLayerMutation = () => {
+      const hasInteractionLayer = hasOphelInteractionLayer(getEdgePeekQueryRoots())
+
+      if (hasInteractionLayer) {
+        clearLauncherPeekHideTimer()
+      } else if (hadInteractionLayer) {
+        scheduleLauncherPeekHide()
+      }
+
+      hadInteractionLayer = hasInteractionLayer
+    }
+
+    const observer = new MutationObserver(handleInteractionLayerMutation)
+    for (const root of getEdgePeekQueryRoots()) {
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+      })
+    }
+
+    return () => {
+      observer.disconnect()
+    }
+  }, [
+    clearLauncherPeekHideTimer,
+    getEdgePeekQueryRoots,
+    isLauncherPeeking,
+    scheduleLauncherPeekHide,
+  ])
+
+  useEffect(() => {
+    return () => {
+      clearLauncherPeekDwellTimer()
+      clearLauncherPeekHideTimer()
+    }
+  }, [clearLauncherPeekDwellTimer, clearLauncherPeekHideTimer])
+
+  // 接收到设置导航事件时，自动打开设置弹窗
+  useEffect(() => {
+    const handleNavigateSettings = (
+      _e: CustomEvent<{ page?: string; subTab?: string; settingId?: string }>,
+    ) => {
+      if (isGlobalSettingsSearchOpen) {
+        searchOpenedFromSettingsRef.current = false
+        settingsSearchRestoreFocusRef.current = null
+        clearSettingsSearchInputDebounceTimer()
+        setIsGlobalSettingsSearchOpen(false)
+        setActiveGlobalSearchCategory("all")
+        setSettingsSearchInputValue("")
+        setSettingsSearchQuery("")
+        setActiveSearchSyntaxSuggestionIndex(-1)
+        setSettingsSearchActiveIndex(0)
+        setSettingsSearchHoverLocked(false)
+        setSettingsSearchNavigationMode("pointer")
+        setExpandedGlobalSearchCategories({})
+        settingsSearchWheelFreezeUntilRef.current = 0
+      }
+
+      if (!isSettingsOpenRef.current) {
+        isSettingsOpenRef.current = true
+
+        if (edgeSnapState && settingsRef.current?.panel?.panelMode === "edge-snap") {
+          showEdgePeek()
+        }
+
+        setIsSettingsOpen(true)
+      }
+    }
+
+    window.addEventListener("ophel:navigateSettingsPage", handleNavigateSettings as EventListener)
+
+    return () =>
+      window.removeEventListener(
+        "ophel:navigateSettingsPage",
+        handleNavigateSettings as EventListener,
+      )
+  }, [
+    clearSettingsSearchInputDebounceTimer,
+    edgeSnapState,
+    isGlobalSettingsSearchOpen,
+    setActiveGlobalSearchCategory,
+    setActiveSearchSyntaxSuggestionIndex,
+    setExpandedGlobalSearchCategories,
+    setSettingsSearchActiveIndex,
+    setSettingsSearchHoverLocked,
+    setSettingsSearchInputValue,
+    setSettingsSearchNavigationMode,
+    setSettingsSearchQuery,
+    setIsGlobalSettingsSearchOpen,
+    showEdgePeek,
+  ])
+
+  const conversationsSnapshot = useConversationsStore((state) => state.conversations)
+  const foldersSnapshot = useFoldersStore((state) => state.folders)
+  const tagsSnapshot = useTagsStore((state) => state.tags)
+  const promptsSnapshot = usePromptsStore((state) => state.prompts)
+
+  const parsedGlobalSearchQuery = useMemo(
+    () => parseGlobalSearchQuery(settingsSearchQuery),
+    [settingsSearchQuery],
+  )
+
+  const activeGlobalSearchSyntaxFilters = useMemo(
+    () => parsedGlobalSearchQuery.filters,
+    [parsedGlobalSearchQuery.filters],
+  )
+
+  const activeGlobalSearchSyntaxDiagnostics = useMemo(
+    () => parsedGlobalSearchQuery.diagnostics,
+    [parsedGlobalSearchQuery.diagnostics],
+  )
+
+  const activeGlobalSearchPlainQuery = useMemo(
+    () => parsedGlobalSearchQuery.plainQuery,
+    [parsedGlobalSearchQuery.plainQuery],
+  )
+
+  const settingsSearchResults = useMemo(
+    // 始终返回完整设置列表，交给后续全局搜索评分流程做多语言匹配
+    () => [...searchSettingsItems(""), ...MODEL_LOCK_SETTINGS_SEARCH_ITEMS],
+    [],
+  )
+
+  useEffect(() => {
+    if (!outlineManager || !isGlobalSettingsSearchOpen) {
+      return
+    }
+
+    outlineManager.setGlobalSearchActive(true)
+    outlineManager.refresh()
+    setOutlineSearchVersion((previousVersion) => previousVersion + 1)
+
+    const unsubscribe = outlineManager.subscribe(() => {
+      setOutlineSearchVersion((previousVersion) => previousVersion + 1)
+    })
+
+    return () => {
+      unsubscribe()
+      outlineManager.setGlobalSearchActive(false)
+    }
+  }, [isGlobalSettingsSearchOpen, outlineManager])
+
+  const settingsSearchHighlightTokens = useMemo(
+    () =>
+      Array.from(new Set(toGlobalSearchTokens(activeGlobalSearchPlainQuery))).sort(
+        (left, right) => right.length - left.length,
+      ),
+    [activeGlobalSearchPlainQuery],
+  )
+
+  const {
+    filteredGlobalSearchResults,
+    globalSearchResultCounts,
+    groupedGlobalSearchResults,
+    visibleGlobalSearchResults,
+  } = useGlobalSearchData({
+    activeGlobalSearchPlainQuery,
+    enableFuzzySearch: isGlobalSearchFuzzySearchEnabled,
+    activeGlobalSearchSyntaxFilters,
+    settingsSearchResults,
+    resolveSettingSearchTitle,
+    getSettingsBreadcrumb,
+    conversationManager,
+    conversationsSnapshot,
+    foldersSnapshot,
+    tagsSnapshot,
+    promptsSnapshot,
+    outlineManager,
+    outlineSearchVersion,
+    getLocalizedText,
+    resolveShortcutLabel,
+    passThroughModifierLabel,
+    activeGlobalSearchCategory,
+    expandedGlobalSearchCategories,
+    allCategoryItemLimit: GLOBAL_SEARCH_ALL_CATEGORY_ITEM_LIMIT,
+  })
+
+  const visibleSearchResultIndexMap = useMemo(() => {
+    const map = new Map<string, number>()
+    visibleGlobalSearchResults.forEach((item, index) => {
+      map.set(item.id, index)
+    })
+    return map
+  }, [visibleGlobalSearchResults])
+
+  const activeVisibleGlobalSearchIndex = useMemo(() => {
+    if (visibleGlobalSearchResults.length === 0) {
+      return -1
+    }
+
+    return Math.min(settingsSearchActiveIndex, visibleGlobalSearchResults.length - 1)
+  }, [settingsSearchActiveIndex, visibleGlobalSearchResults.length])
+
+  const activeGlobalSearchOptionId =
+    activeVisibleGlobalSearchIndex >= 0
+      ? `${GLOBAL_SEARCH_OPTION_ID_PREFIX}-${activeVisibleGlobalSearchIndex}`
+      : undefined
+
+  const activeGlobalSearchCategoryDefinition = useMemo(
+    () =>
+      GLOBAL_SEARCH_CATEGORY_DEFINITIONS.find(
+        (category) => category.id === activeGlobalSearchCategory,
+      ) || GLOBAL_SEARCH_CATEGORY_DEFINITIONS[0],
+    [activeGlobalSearchCategory],
+  )
+
+  const resolvedActiveGlobalSearchCategoryText = useMemo(
+    () => ({
+      label: getLocalizedText(activeGlobalSearchCategoryDefinition.label),
+      placeholder: getLocalizedText(activeGlobalSearchCategoryDefinition.placeholder),
+      emptyText: getLocalizedText(activeGlobalSearchCategoryDefinition.emptyText),
+    }),
+    [activeGlobalSearchCategoryDefinition, getLocalizedText],
+  )
+
+  const resolvedGlobalSearchCategoryLabels = useMemo(
+    () =>
+      GLOBAL_SEARCH_CATEGORY_DEFINITIONS.reduce(
+        (collector, category) => {
+          collector[category.id] = getLocalizedText(category.label)
+          return collector
+        },
+        {} as Record<GlobalSearchCategoryId, string>,
+      ),
+    [getLocalizedText],
+  )
+
+  const resolvedGlobalSearchResultCategoryLabels = useMemo(
+    () =>
+      (
+        Object.entries(GLOBAL_SEARCH_RESULT_CATEGORY_LABELS) as [
+          GlobalSearchResultCategory,
+          LocalizedLabelDefinition,
+        ][]
+      ).reduce(
+        (collector, [category, definition]) => {
+          collector[category] = getLocalizedText(definition)
+          return collector
+        },
+        {} as Record<GlobalSearchResultCategory, string>,
+      ),
+    [getLocalizedText],
+  )
+
+  const resolvedGlobalSearchMatchReasonLabels = useMemo(
+    () =>
+      (
+        Object.entries(GLOBAL_SEARCH_MATCH_REASON_LABEL_DEFINITIONS) as [
+          GlobalSearchMatchReason,
+          LocalizedLabelDefinition,
+        ][]
+      ).reduce(
+        (collector, [reason, definition]) => {
+          collector[reason] = getLocalizedText(definition)
+          return collector
+        },
+        {} as Record<GlobalSearchMatchReason, string>,
+      ),
+    [getLocalizedText],
+  )
+
+  const {
+    activeGlobalSearchFilterChips,
+    hasOverflowGlobalSearchFilterChips,
+    globalSearchSyntaxDiagnosticMessages,
+    globalSearchSyntaxHelpTitle,
+    globalSearchSyntaxHelpDescription,
+    globalSearchSyntaxHelpItems,
+    globalSearchSyntaxSuggestions,
+    shouldShowGlobalSearchSyntaxSuggestions,
+  } = useGlobalSearchSyntax({
+    getLocalizedText,
+    activeGlobalSearchSyntaxFilters,
+    filterChipMaxCount: GLOBAL_SEARCH_FILTER_CHIP_MAX_COUNT,
+    isGlobalSettingsSearchOpen,
+    settingsSearchInputValue,
+    filteredGlobalSearchResults,
+    suggestionLimit: GLOBAL_SEARCH_SYNTAX_SUGGESTION_LIMIT,
+  })
+
+  const globalSearchListboxLabel = useMemo(
+    () =>
+      getLocalizedText({
+        key: "globalSearchResultsLabel",
+        fallback: "Global search results",
+      }),
+    [getLocalizedText],
+  )
+
+  const applyGlobalSearchSyntaxSuggestion = useCallback(
+    (suggestion: GlobalSearchSyntaxSuggestionItem) => {
+      const trailingTokenInfo = getGlobalSearchTrailingTokenInfo(settingsSearchInputValue)
+      const shouldAppendTrailingSpace = !suggestion.token.endsWith(":")
+      const nextToken = `${suggestion.token}${shouldAppendTrailingSpace ? " " : ""}`
+      const nextValue = trailingTokenInfo
+        ? `${settingsSearchInputValue.slice(0, trailingTokenInfo.start)}${nextToken}`
+        : settingsSearchInputValue.trim().length > 0
+          ? `${settingsSearchInputValue}${settingsSearchInputValue.endsWith(" ") ? "" : " "}${nextToken}`
+          : nextToken
+
+      syncGlobalSearchValueAndCategory(nextValue)
+      setActiveSearchSyntaxSuggestionIndex(-1)
+      setSettingsSearchActiveIndex(0)
+
+      window.requestAnimationFrame(() => {
+        const inputElement = settingsSearchInputRef.current
+        if (!inputElement) {
+          return
+        }
+
+        const cursorPosition = nextValue.length
+        inputElement.focus({ preventScroll: true })
+        inputElement.setSelectionRange(cursorPosition, cursorPosition)
+      })
+    },
+    [
+      settingsSearchInputValue,
+      setActiveSearchSyntaxSuggestionIndex,
+      setSettingsSearchActiveIndex,
+      syncGlobalSearchValueAndCategory,
+    ],
+  )
+
+  const applyGlobalSearchSyntaxHelpItem = useCallback(
+    (item: GlobalSearchSyntaxSuggestionItem) => {
+      applyGlobalSearchSyntaxSuggestion(item)
+      setShowGlobalSearchSyntaxHelp(false)
+    },
+    [applyGlobalSearchSyntaxSuggestion, setShowGlobalSearchSyntaxHelp],
+  )
+
+  const handleRemoveGlobalSearchFilterChip = useCallback(
+    (chipId: string) => {
+      const nextFilters = activeGlobalSearchSyntaxFilters.filter((filter) => filter.id !== chipId)
+      const nextQuery = stringifyGlobalSearchQuery({
+        plainQuery: activeGlobalSearchPlainQuery,
+        filters: nextFilters,
+      })
+
+      syncSettingsSearchInputAndQuery(nextQuery)
+      setActiveSearchSyntaxSuggestionIndex(-1)
+      setSettingsSearchActiveIndex(0)
+    },
+    [
+      activeGlobalSearchPlainQuery,
+      activeGlobalSearchSyntaxFilters,
+      setActiveSearchSyntaxSuggestionIndex,
+      setSettingsSearchActiveIndex,
+      syncSettingsSearchInputAndQuery,
+    ],
+  )
+
+  const clearAllGlobalSearchSyntaxFilters = useCallback(() => {
+    syncSettingsSearchInputAndQuery(activeGlobalSearchPlainQuery)
+    setActiveSearchSyntaxSuggestionIndex(-1)
+    setSettingsSearchActiveIndex(0)
+  }, [
+    activeGlobalSearchPlainQuery,
+    setActiveSearchSyntaxSuggestionIndex,
+    setSettingsSearchActiveIndex,
+    syncSettingsSearchInputAndQuery,
+  ])
+
+  const activeGlobalSearchContext = useMemo(() => {
+    if (activeVisibleGlobalSearchIndex < 0) {
+      return null
+    }
+
+    const activeItem = visibleGlobalSearchResults[activeVisibleGlobalSearchIndex]
+    if (!activeItem) {
+      return null
+    }
+
+    const label = resolvedGlobalSearchResultCategoryLabels[activeItem.category]
+    const currentItemText = formatLocalizedText(
+      {
+        key: "globalSearchContextCurrentItem",
+        fallback: "第 {current} 项",
+      },
+      {
+        current: String(activeVisibleGlobalSearchIndex + 1),
+      },
+    )
+
+    if (activeGlobalSearchCategory !== "all") {
+      return {
+        label,
+        meta: `${currentItemText} · ${formatLocalizedText(
+          {
+            key: "globalSearchContextTotalItems",
+            fallback: "共 {total} 项",
+          },
+          {
+            total: String(visibleGlobalSearchResults.length),
+          },
+        )}`,
+      }
+    }
+
+    const activeGroup = groupedGlobalSearchResults.find(
+      (group) => group.category === activeItem.category,
+    )
+
+    if (!activeGroup) {
+      return {
+        label,
+        meta: `${currentItemText} · ${formatLocalizedText(
+          {
+            key: "globalSearchContextTotalItems",
+            fallback: "共 {total} 项",
+          },
+          {
+            total: String(visibleGlobalSearchResults.length),
+          },
+        )}`,
+      }
+    }
+
+    return {
+      label,
+      meta: `${currentItemText} · ${formatLocalizedText(
+        {
+          key: "globalSearchContextShownProgress",
+          fallback: "已显示 {shown}/{total}",
+        },
+        {
+          shown: String(activeGroup.items.length),
+          total: String(activeGroup.totalCount),
+        },
+      )}`,
+    }
+  }, [
+    activeGlobalSearchCategory,
+    activeVisibleGlobalSearchIndex,
+    formatLocalizedText,
+    groupedGlobalSearchResults,
+    resolvedGlobalSearchResultCategoryLabels,
+    visibleGlobalSearchResults,
+  ])
+
+  const closeSettingsModal = useCallback(() => {
+    isSettingsOpenRef.current = false
+    setIsSettingsOpen(false)
+    setIsHoverWidthSettingsPreviewActive(false)
+
+    const currentSettings = settingsRef.current
+    if (currentSettings?.panel?.panelMode !== "edge-snap") return
+
+    const panel = findUiElement(".gh-main-panel")
+
+    if (!panel) return
+
+    const isAlreadySnapped =
+      panel.classList.contains("edge-snapped-left") ||
+      panel.classList.contains("edge-snapped-right")
+
+    if (!isAlreadySnapped) {
+      const rect = panel.getBoundingClientRect()
+      const snapThreshold = currentSettings?.panel?.edgeSnapThreshold ?? 30
+
+      if (rect.left < snapThreshold) {
+        setEdgeSnapState("left")
+      } else if (window.innerWidth - rect.right < snapThreshold) {
+        setEdgeSnapState("right")
+      }
+    }
+
+    scheduleEdgePeekSync()
+  }, [findUiElement, scheduleEdgePeekSync])
+
+  const releaseMainPanelHoverWidth = useCallback(() => {
+    setIsHoverWidthSettingsPreviewActive(false)
+    setHoverWidthReleaseToken((value) => value + 1)
+  }, [])
+
+  const openGlobalSettingsSearch = useCallback(
+    (source: GlobalSearchOpenSource = "ui") => {
+      globalSearchOpenSourceRef.current = source
+
+      if (isSettingsOpenRef.current) {
+        searchOpenedFromSettingsRef.current = true
+        closeSettingsModal()
+      } else {
+        searchOpenedFromSettingsRef.current = false
+      }
+
+      releaseMainPanelHoverWidth()
+
+      if (edgeSnapState && settingsRef.current?.panel?.panelMode === "edge-snap") {
+        showEdgePeek()
+      }
+
+      const activeElement = document.activeElement
+      if (activeElement instanceof HTMLElement && activeElement !== document.body) {
+        settingsSearchRestoreFocusRef.current = activeElement
+      } else {
+        settingsSearchRestoreFocusRef.current = null
+      }
+
+      clearSettingsSearchInputDebounceTimer()
+      setSettingsSearchInputValue("")
+      setSettingsSearchQuery("")
+      setShowGlobalSearchSyntaxHelp(false)
+      setActiveSearchSyntaxSuggestionIndex(-1)
+      setActiveGlobalSearchCategory("all")
+      setSettingsSearchActiveIndex(0)
+      setSettingsSearchHoverLocked(false)
+      setSettingsSearchNavigationMode("pointer")
+      setExpandedGlobalSearchCategories({})
+      settingsSearchWheelFreezeUntilRef.current = 0
+      setIsGlobalSettingsSearchOpen(true)
+    },
+    [
+      clearSettingsSearchInputDebounceTimer,
+      closeSettingsModal,
+      edgeSnapState,
+      releaseMainPanelHoverWidth,
+      setActiveGlobalSearchCategory,
+      setActiveSearchSyntaxSuggestionIndex,
+      setExpandedGlobalSearchCategories,
+      setSettingsSearchActiveIndex,
+      setSettingsSearchHoverLocked,
+      setSettingsSearchInputValue,
+      setSettingsSearchNavigationMode,
+      setSettingsSearchQuery,
+      setIsGlobalSettingsSearchOpen,
+      setShowGlobalSearchSyntaxHelp,
+      showEdgePeek,
+    ],
+  )
+
+  const closeGlobalSettingsSearch = useCallback(
+    (options?: { restoreFocus?: boolean; reopenSettings?: boolean }) => {
+      const shouldRestoreFocus = options?.restoreFocus ?? true
+      const shouldReopenSettings = options?.reopenSettings ?? false
+      const restoreElement = settingsSearchRestoreFocusRef.current
+      settingsSearchRestoreFocusRef.current = null
+      searchOpenedFromSettingsRef.current = false
+
+      clearSettingsSearchInputDebounceTimer()
+      setIsGlobalSettingsSearchOpen(false)
+      setActiveGlobalSearchCategory("all")
+      setSettingsSearchInputValue("")
+      setSettingsSearchQuery("")
+      setShowGlobalSearchSyntaxHelp(false)
+      setActiveSearchSyntaxSuggestionIndex(-1)
+      setSettingsSearchActiveIndex(0)
+      setSettingsSearchHoverLocked(false)
+      setSettingsSearchNavigationMode("pointer")
+      setExpandedGlobalSearchCategories({})
+      settingsSearchWheelFreezeUntilRef.current = 0
+
+      if (shouldReopenSettings) {
+        isSettingsOpenRef.current = true
+
+        if (edgeSnapState && settingsRef.current?.panel?.panelMode === "edge-snap") {
+          showEdgePeek()
+        }
+
+        setIsSettingsOpen(true)
+        return
+      }
+
+      scheduleEdgePeekSync()
+
+      if (!shouldRestoreFocus || !restoreElement || !restoreElement.isConnected) {
+        return
+      }
+
+      window.requestAnimationFrame(() => {
+        if (!restoreElement.isConnected) {
+          return
+        }
+
+        try {
+          restoreElement.focus({ preventScroll: true })
+        } catch {
+          restoreElement.focus()
+        }
+      })
+    },
+    [
+      clearSettingsSearchInputDebounceTimer,
+      edgeSnapState,
+      scheduleEdgePeekSync,
+      setActiveGlobalSearchCategory,
+      setActiveSearchSyntaxSuggestionIndex,
+      setExpandedGlobalSearchCategories,
+      setSettingsSearchActiveIndex,
+      setSettingsSearchHoverLocked,
+      setSettingsSearchInputValue,
+      setSettingsSearchNavigationMode,
+      setSettingsSearchQuery,
+      setIsGlobalSettingsSearchOpen,
+      setShowGlobalSearchSyntaxHelp,
+      showEdgePeek,
+    ],
+  )
+
+  const openSettingsModal = useCallback(() => {
+    if (isGlobalSettingsSearchOpen) {
+      closeGlobalSettingsSearch({ restoreFocus: false })
+    }
+
+    releaseMainPanelHoverWidth()
+    searchOpenedFromSettingsRef.current = false
+    isSettingsOpenRef.current = true
+
+    if (edgeSnapState && settingsRef.current?.panel?.panelMode === "edge-snap") {
+      showEdgePeek()
+    }
+
+    setIsSettingsOpen(true)
+  }, [
+    closeGlobalSettingsSearch,
+    edgeSnapState,
+    isGlobalSettingsSearchOpen,
+    releaseMainPanelHoverWidth,
+    showEdgePeek,
+  ])
+
+  const navigateToSearchResult = useCallback(
+    async (item: GlobalSearchResultItem) => {
+      const navigationRequestId = ++outlineSearchNavigationRequestIdRef.current
+      closeGlobalSettingsSearch({ restoreFocus: false })
+
+      if (item.tipId) {
+        if (item.tipHighlightTarget) {
+          const targetEl = findUiElement(`[data-tip-target="${item.tipHighlightTarget}"]`)
+          if (targetEl) {
+            targetEl.classList.remove("feature-highlight")
+            // Force reflow to restart animation
+            void targetEl.offsetWidth
+            targetEl.classList.add("feature-highlight")
+            setTimeout(() => targetEl.classList.remove("feature-highlight"), 2500)
+            targetEl.scrollIntoView({ behavior: "smooth", block: "nearest" })
+            return
+          }
+        }
+        // 无可定位 UI 元素时，优先提示可执行动作文案，而不是说明文案
+        showToast(item.tipActionText || item.snippet || item.title, 3000)
+        return
+      }
+
+      if (item.category === "settings" && item.settingId) {
+        window.dispatchEvent(
+          new CustomEvent("ophel:navigateSettingsPage", {
+            detail: { settingId: item.settingId },
+          }),
+        )
+        return
+      }
+
+      if (item.category === "outline" && item.outlineTarget && outlineManager) {
+        const findOutlineNodeByIndex = (
+          nodes: OutlineNode[],
+          targetIndex: number,
+        ): OutlineNode | null => {
+          for (const node of nodes) {
+            if (node.index === targetIndex) {
+              return node
+            }
+            if (node.children && node.children.length > 0) {
+              const found = findOutlineNodeByIndex(node.children, targetIndex)
+              if (found) return found
+            }
+          }
+          return null
+        }
+
+        const targetNode = findOutlineNodeByIndex(
+          outlineManager.getTree(),
+          item.outlineTarget.index,
+        )
+        let targetElement = targetNode?.element || null
+
+        if (!targetElement || !targetElement.isConnected) {
+          const found = await outlineManager.resolveOutlineTarget(
+            item.outlineTarget,
+            item.outlineTarget.queryIndex,
+          )
+          if (found) {
+            targetElement = found
+          }
+        }
+
+        if (navigationRequestId !== outlineSearchNavigationRequestIdRef.current) {
+          return
+        }
+
+        if (targetElement && targetElement.isConnected) {
+          outlineManager.scrollToOutlineTarget(targetElement as HTMLElement)
+          targetElement.classList.add("outline-highlight")
+          setTimeout(() => targetElement?.classList.remove("outline-highlight"), 2000)
+          return
+        }
+
+        if (
+          item.outlineTarget.isGhost &&
+          item.outlineTarget.scrollTop !== undefined &&
+          outlineManager.scrollToOutlinePosition(item.outlineTarget.scrollTop)
+        ) {
+          showToast(t("bookmarkContentMissing"), 3000)
+          return
+        }
+
+        return
+      }
+
+      if (item.category === "prompts" && item.promptId) {
+        const targetPrompt = promptsSnapshot.find((prompt) => prompt.id === item.promptId)
+        if (!targetPrompt) {
+          return
+        }
+
+        const openPromptsTab = () => {
+          persistPanelExpanded(true)
+
+          const tabOrder = settings?.features?.order || DEFAULT_SETTINGS.features.order
+          const promptsTabIndex = tabOrder.indexOf(TAB_IDS.PROMPTS)
+          if (promptsTabIndex >= 0) {
+            window.dispatchEvent(
+              new CustomEvent("ophel:switchTab", {
+                detail: { index: promptsTabIndex },
+              }),
+            )
+          }
+        }
+
+        const locatePrompt = () => {
+          setSelectedPrompt(null)
+          openPromptsTab()
+
+          const pendingDetail = {
+            promptId: targetPrompt.id,
+          }
+          window.__ophelPendingLocatePrompt = pendingDetail
+
+          window.dispatchEvent(
+            new CustomEvent("ophel:locatePrompt", {
+              detail: pendingDetail,
+            }),
+          )
+        }
+
+        const promptEnterBehavior = settings?.globalSearch?.promptEnterBehavior ?? "smart"
+        if (promptEnterBehavior === "locate") {
+          locatePrompt()
+          return
+        }
+
+        if (!promptManager) {
+          openPromptsTab()
+          return
+        }
+
+        if (hasPromptVariables(targetPrompt.content)) {
+          setSelectedPrompt(null)
+          openPromptsTab()
+
+          const pendingDetail = {
+            promptId: targetPrompt.id,
+            submitAfterInsert: false,
+          }
+          window.__ophelPendingPromptVariableDialog = pendingDetail
+
+          window.dispatchEvent(
+            new CustomEvent("ophel:openPromptVariableDialog", {
+              detail: pendingDetail,
+            }),
+          )
+          return
+        }
+
+        void (async () => {
+          const inserted = await promptManager.insertPrompt(targetPrompt.content)
+          if (inserted) {
+            promptManager.updateLastUsed(targetPrompt.id)
+            setSelectedPrompt(targetPrompt)
+            showToast(`${t("inserted")}: ${targetPrompt.title}`)
+            return
+          }
+
+          locatePrompt()
+          showToast(t("insertFailed"))
+        })()
+
+        return
+      }
+
+      if (item.category === "conversations" && item.conversationId) {
+        // 站外会话没有当前站点的适配器上下文，直接新标签打开会话链接
+        if (item.offsiteSite) {
+          if (item.conversationUrl) {
+            platform.openTab(item.conversationUrl)
+          } else {
+            showToast(t("noConversationToLocate"))
+          }
+          return
+        }
+        adapter?.navigateToConversation(item.conversationId, item.conversationUrl)
+      }
+    },
+    [
+      adapter,
+      closeGlobalSettingsSearch,
+      findUiElement,
+      outlineManager,
+      persistPanelExpanded,
+      promptManager,
+      promptsSnapshot,
+      settings,
+    ],
+  )
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen) {
+      return
+    }
+
+    settingsSearchInputRef.current?.focus()
+    settingsSearchInputRef.current?.select()
+  }, [isGlobalSettingsSearchOpen])
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen) {
+      return
+    }
+
+    if (globalSearchOpenSourceRef.current !== "ui") {
+      return
+    }
+
+    tryShowGlobalSearchShortcutNudge()
+  }, [isGlobalSettingsSearchOpen, tryShowGlobalSearchShortcutNudge])
+
+  // Create a ref for isGlobalSettingsSearchOpen to access it in the event listener without re-binding
+  const isGlobalSettingsSearchOpenRef = useRef(isGlobalSettingsSearchOpen)
+  useEffect(() => {
+    isGlobalSettingsSearchOpenRef.current = isGlobalSettingsSearchOpen
+  }, [isGlobalSettingsSearchOpen])
+
+  const openGlobalSearchByShortcut = useCallback(() => {
+    if (isGlobalSettingsSearchOpenRef.current) {
+      return
+    }
+
+    // 通过自定义快捷键触发时重置双击 Shift 状态，避免误判
+    lastShiftPressedAtRef.current = 0
+    markGlobalSearchShortcutUsed()
+    openGlobalSettingsSearch("shortcut")
+  }, [markGlobalSearchShortcutUsed, openGlobalSettingsSearch])
+
+  useEffect(() => {
+    const handleOpenSearchShortcut = (event: KeyboardEvent) => {
+      // Use ref to check if search is already open
+      if (isGlobalSettingsSearchOpenRef.current) {
+        return
+      }
+
+      // 非 Shift 按键会中断双击 Shift 检测，防止输入时误触
+      if (event.key !== "Shift") {
+        lastShiftPressedAtRef.current = 0
+      }
+
+      if (event.key !== "Shift" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) {
+        return
+      }
+
+      const now = Date.now()
+      // Use settingsRef to get the latest settings without re-binding listener
+      const isDoubleShiftEnabled =
+        settingsRef.current?.globalSearch?.doubleShift ?? DEFAULT_SETTINGS.globalSearch.doubleShift
+
+      if (isDoubleShiftEnabled && now - lastShiftPressedAtRef.current <= 360) {
+        event.preventDefault()
+        event.stopPropagation()
+        lastShiftPressedAtRef.current = 0
+        markGlobalSearchShortcutUsed()
+        openGlobalSettingsSearch("shortcut")
+        return
+      }
+
+      lastShiftPressedAtRef.current = now
+    }
+
+    window.addEventListener("keydown", handleOpenSearchShortcut, true)
+    return () => {
+      window.removeEventListener("keydown", handleOpenSearchShortcut, true)
+    }
+  }, [markGlobalSearchShortcutUsed, openGlobalSettingsSearch])
+
+  useEffect(() => {
+    const handleOpenSearchEvent = () => {
+      openGlobalSettingsSearch("event")
+    }
+
+    window.addEventListener("ophel:openSettingsSearch", handleOpenSearchEvent)
+    return () => {
+      window.removeEventListener("ophel:openSettingsSearch", handleOpenSearchEvent)
+    }
+  }, [openGlobalSettingsSearch])
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen || !showGlobalSearchSyntaxHelp) {
+      return
+    }
+
+    const handleOutsidePress = (event: MouseEvent) => {
+      const path = event.composedPath ? event.composedPath() : [event.target as Node]
+
+      if (
+        globalSearchSyntaxHelpTriggerRef.current &&
+        path.includes(globalSearchSyntaxHelpTriggerRef.current)
+      ) {
+        return
+      }
+
+      if (
+        globalSearchSyntaxHelpPopoverRef.current &&
+        path.includes(globalSearchSyntaxHelpPopoverRef.current)
+      ) {
+        return
+      }
+
+      setShowGlobalSearchSyntaxHelp(false)
+    }
+
+    document.addEventListener("mousedown", handleOutsidePress, true)
+
+    return () => {
+      document.removeEventListener("mousedown", handleOutsidePress, true)
+    }
+  }, [isGlobalSettingsSearchOpen, setShowGlobalSearchSyntaxHelp, showGlobalSearchSyntaxHelp])
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen) {
+      hideGlobalSearchPromptPreview()
+      return
+    }
+
+    if (settingsSearchNavigationMode !== "keyboard") {
+      return
+    }
+
+    const activeItem = visibleGlobalSearchResults[settingsSearchActiveIndex]
+    if (!activeItem || activeItem.category !== "prompts") {
+      hideGlobalSearchPromptPreview()
+      return
+    }
+
+    const container = settingsSearchResultsRef.current
+    if (!container) {
+      return
+    }
+
+    const anchorElement = container.querySelector<HTMLElement>(
+      `[data-global-search-index=\"${settingsSearchActiveIndex}\"]`,
+    )
+
+    if (!anchorElement) {
+      return
+    }
+
+    scheduleGlobalSearchPromptPreview({
+      item: activeItem,
+      anchorElement,
+      delay: GLOBAL_SEARCH_PROMPT_PREVIEW_KEYBOARD_DELAY_MS,
+      source: "keyboard",
+    })
+  }, [
+    hideGlobalSearchPromptPreview,
+    isGlobalSettingsSearchOpen,
+    scheduleGlobalSearchPromptPreview,
+    settingsSearchActiveIndex,
+    settingsSearchNavigationMode,
+    visibleGlobalSearchResults,
+  ])
+
+  useEffect(() => {
+    setSettingsSearchActiveIndex(0)
+    setSettingsSearchHoverLocked(false)
+    setSettingsSearchNavigationMode("pointer")
+    setExpandedGlobalSearchCategories({})
+    settingsSearchWheelFreezeUntilRef.current = 0
+    hideGlobalSearchPromptPreview()
+  }, [
+    activeGlobalSearchCategory,
+    hideGlobalSearchPromptPreview,
+    setExpandedGlobalSearchCategories,
+    setSettingsSearchActiveIndex,
+    setSettingsSearchHoverLocked,
+    setSettingsSearchNavigationMode,
+    settingsSearchQuery,
+  ])
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen) {
+      hideGlobalSearchPromptPreview()
+    }
+  }, [hideGlobalSearchPromptPreview, isGlobalSettingsSearchOpen])
+
+  useEffect(() => {
+    if (!globalSearchPromptPreview || !promptPreviewContainerRef.current) {
+      return
+    }
+
+    initCopyButtons(promptPreviewContainerRef.current, { size: 14 })
+  }, [globalSearchPromptPreview])
+
+  useEffect(() => {
+    if (!isGlobalSettingsSearchOpen || !globalSearchPromptPreview) {
+      return
+    }
+
+    const handlePositionUpdate = () => {
+      refreshGlobalSearchPromptPreviewAnchorRect()
+    }
+
+    const resultContainer = settingsSearchResultsRef.current
+    window.addEventListener("resize", handlePositionUpdate)
+    window.addEventListener("scroll", handlePositionUpdate, true)
+    resultContainer?.addEventListener("scroll", handlePositionUpdate)
+
+    return () => {
+      window.removeEventListener("resize", handlePositionUpdate)
+      window.removeEventListener("scroll", handlePositionUpdate, true)
+      resultContainer?.removeEventListener("scroll", handlePositionUpdate)
+    }
+  }, [
+    globalSearchPromptPreview,
+    isGlobalSettingsSearchOpen,
+    refreshGlobalSearchPromptPreviewAnchorRect,
+  ])
+
+  useEffect(() => {
+    return () => {
+      clearPromptPreviewTimer()
+      clearPromptPreviewHideTimer()
+    }
+  }, [clearPromptPreviewHideTimer, clearPromptPreviewTimer])
+
+  useGlobalSearchControllerKeyboard(globalSearchController, {
+    categoryIds: GLOBAL_SEARCH_CATEGORY_DEFINITIONS.map((category) => category.id),
+    shouldShowGlobalSearchSyntaxSuggestions,
+    globalSearchSyntaxSuggestions,
+    applyGlobalSearchSyntaxSuggestion,
+    visibleGlobalSearchResults,
+    navigateToSearchResult,
+    closeGlobalSettingsSearch,
+    getShouldReturnToSettingsOnEscape: () => searchOpenedFromSettingsRef.current,
+    keyboardSafeTop: GLOBAL_SEARCH_KEYBOARD_SAFE_TOP,
+    keyboardSafeBottom: GLOBAL_SEARCH_KEYBOARD_SAFE_BOTTOM,
+  })
+
+  // 当设置中的语言变化时，同步更新 i18n
+  useEffect(() => {
+    if (isSettingsHydrated && settings?.language) {
+      setLanguage(settings.language)
+      setI18nRenderTick((prev) => prev + 1)
+    }
+  }, [settings?.language, isSettingsHydrated])
+
+  // 处理提示词选中
+  const handlePromptSelect = useCallback((prompt: Prompt | null) => {
+    setSelectedPrompt(prompt)
+  }, [])
+
+  // 清除选中的提示词
+  const handleClearSelectedPrompt = useCallback(() => {
+    setSelectedPrompt(null)
+    // 同时清空输入框（可选）
+    if (adapter) {
+      adapter.clearTextarea()
+    }
+  }, [adapter])
+
+  // 单独用 useEffect 同步 settings 变化到 manager
+  useEffect(() => {
+    if (outlineManager && settings) {
+      outlineManager.updateSettings(settings.features?.outline)
+    }
+  }, [outlineManager, settings])
+
+  // 同步 ConversationManager 设置
+  useEffect(() => {
+    if (conversationManager && settings) {
+      conversationManager.updateSettings({
+        syncUnpin: settings.features?.conversations?.syncUnpin ?? false,
+      })
+    }
+  }, [conversationManager, settings])
+
+  // 从 window 获取 main.ts 创建的全局 ThemeManager 实例
+  // userscript 场景下 App 可能先于核心模块渲染，这里统一复用全局单例
+  const themeManager = useMemo(() => {
+    const currentAdapter = getAdapter()
+    const currentSiteInstanceKey = currentAdapter?.getSiteInstanceKey() || "_default"
+    const fallbackTheme = settings ? getSiteTheme(settings, currentSiteInstanceKey) : undefined
+
+    return ensureGlobalThemeManager({
+      mode: fallbackTheme?.mode || "light",
+      adapter,
+      lightPresetId: fallbackTheme?.lightStyleId || "google-gradient",
+      darkPresetId: fallbackTheme?.darkStyleId || "classic-dark",
+      syncNativePageTheme: settings?.theme?.syncNativePageTheme ?? true,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在初始化时获取
+  }, [])
+
+  // 使用 useSyncExternalStore 订阅 ThemeManager 的主题模式
+  // 这让 ThemeManager 成为唯一的主题状态源，避免双重状态导致的同步问题
+  const themeMode = useSyncExternalStore(themeManager.subscribe, themeManager.getSnapshot)
+
+  // 动态注册主题变化回调，当页面主题变化时同步更新 settings
+  // 注意：themeMode 由 useSyncExternalStore 自动订阅更新，不需要手动 setThemeMode
+  useEffect(() => {
+    if (!isSettingsHydrated) {
+      return
+    }
+
+    const handleThemeModeChange = (
+      mode: "light" | "dark",
+      preference?: "light" | "dark" | "system",
+    ) => {
+      if (!useSettingsStore.getState()._hasHydrated) {
+        return
+      }
+
+      const nextPreference = preference || mode
+      // 使用 ref 获取最新 settings，避免闭包捕获过期值
+      const currentSettings = settingsRef.current
+      const sites = currentSettings?.theme?.sites || {}
+
+      // 获取当前站点 ID
+      const currentAdapter = getAdapter()
+      const currentSiteInstanceKey = currentAdapter?.getSiteInstanceKey() || "_default"
+
+      // 确保站点配置有完整的默认值，但优先使用已有配置
+      const existingSite = currentSettings
+        ? getSiteTheme(currentSettings, currentSiteInstanceKey)
+        : sites._default
+      const siteConfig = {
+        lightStyleId: "google-gradient",
+        darkStyleId: "classic-dark",
+        mode: "light" as const,
+        ...existingSite, // 已有配置覆盖默认值
+      }
+
+      // 只更新 mode 字段，保留用户已有的主题配置
+      setSettings({
+        theme: {
+          ...currentSettings?.theme,
+          sites: {
+            ...sites,
+            [currentSiteInstanceKey]: {
+              ...siteConfig,
+              mode: nextPreference, // 最后更新 mode，确保生效
+            },
+          },
+        },
+      })
+    }
+    themeManager.setOnModeChange(handleThemeModeChange)
+
+    // 清理时移除回调
+    return () => {
+      themeManager.setOnModeChange(undefined)
+    }
+  }, [themeManager, setSettings, isSettingsHydrated]) // 移除 settings?.theme 依赖，通过 ref 访问最新值
+
+  const themeSites = settings?.theme?.sites
+  const syncUnpin = settings?.features?.conversations?.syncUnpin
+  const syncDelete = settings?.features?.conversations?.syncDelete
+  const outlineEnabled = settings?.features?.outline?.enabled ?? true
+  const inlineBookmarkMode = settings?.features?.outline?.inlineBookmarkMode
+  const hasSettings = Boolean(settings)
+  const quickButtonsSettings = settings?.quickButtons || DEFAULT_SETTINGS.quickButtons
+  const collapsedButtons = quickButtonsSettings.collapsed
+  const floatingToolbarEnabled =
+    collapsedButtons.find((btn) => btn.id === "floatingToolbar")?.enabled ?? true
+  const floatingToolbarOpen = quickButtonsSettings.floatingToolbar?.open ?? true
+  const isScrollLockActive = settings?.panel?.preventAutoScroll ?? false
+  const ghostBookmarkCount = outlineManager?.getGhostBookmarkIds().length ?? 0
+
+  useEffect(() => {
+    if (!floatingToolbarEnabled || !floatingToolbarOpen) {
+      setFloatingToolbarMoveState(null)
+      setIsFloatingToolbarClearOpen(false)
+    }
+  }, [floatingToolbarEnabled, floatingToolbarOpen])
+
+  // 监听主题预置变化，动态更新 ThemeManager
+  // Zustand 不存在 Plasmo useStorage 的缓存问题，无需启动保护期
+  useEffect(() => {
+    if (!isSettingsHydrated) return // 等待 hydration 完成
+
+    // 使用当前站点的配置而非 _default
+    const currentAdapter = getAdapter()
+    const currentSiteInstanceKey = currentAdapter?.getSiteInstanceKey() || "_default"
+    const siteTheme = themeSites?.[currentSiteInstanceKey] || themeSites?._default
+    const lightId = siteTheme?.lightStyleId
+    const darkId = siteTheme?.darkStyleId
+
+    if (lightId && darkId) {
+      themeManager.setPresets(lightId, darkId)
+    }
+  }, [themeSites, themeManager, isSettingsHydrated])
+
+  // 监听自定义样式变化，同步到 ThemeManager
+  useEffect(() => {
+    if (!isSettingsHydrated) return
+    themeManager.setCustomStyles(settings?.theme?.customStyles || [])
+  }, [settings?.theme?.customStyles, themeManager, isSettingsHydrated])
+
+  useEffect(() => {
+    if (!isSettingsHydrated) return
+    themeManager.setNativeThemeOverrideEnabled(settings?.theme?.syncNativePageTheme ?? true)
+  }, [settings?.theme?.syncNativePageTheme, themeManager, isSettingsHydrated])
+
+  // 主题切换（异步处理，支持 View Transitions API 动画）
+  // 不在这里更新 React 状态，由 ThemeManager 的 onModeChange 回调在动画完成后统一处理
+  const handleThemeToggle = useCallback(
+    async (event?: ThemeTransitionOrigin) => {
+      await themeManager.toggle(event)
+      // 状态更新由 onModeChange 回调处理，不在这里直接更新
+      // 这避免了动画完成前触发 React 重渲染导致的闪烁
+    },
+    [themeManager],
+  )
+
+  // 启动宿主页主题监听
+  useEffect(() => {
+    if (!isSettingsHydrated) {
+      return
+    }
+
+    // 不再调用 applyModePreference，由 main.ts 负责初始应用
+    // 这里只启动监听器，监听页面主题变化（如浏览器/站点自动切换）
+    themeManager.startThemeMonitoring()
+
+    return () => {
+      // 清理监听器
+      themeManager.stopThemeMonitoring()
+    }
+  }, [themeManager, isSettingsHydrated])
+
+  // 初始化
+  useEffect(() => {
+    if (promptManager) {
+      promptManager.init()
+    }
+    if (conversationManager) {
+      conversationManager.init()
+    }
+    if (outlineManager) {
+      outlineManager.refresh()
+      // SPA 路由变化：立刻让大纲面板清掉上一个会话的内容、并安排几次错峰 refresh，
+      // 避免切换到新对话后大纲面板仍在显示旧对话条目。modules-init.ts 会在
+      // popstate / pushState / replaceState 时 dispatch "gh-url-change"。
+      const onUrlChange = () => outlineManager.handleUrlChange()
+      const onRefreshOutline = () => outlineManager.refresh()
+      window.addEventListener("gh-url-change", onUrlChange)
+      window.addEventListener("ophel:refreshOutline", onRefreshOutline)
+      return () => {
+        window.removeEventListener("gh-url-change", onUrlChange)
+        window.removeEventListener("ophel:refreshOutline", onRefreshOutline)
+        conversationManager?.destroy()
+      }
+    }
+  }, [promptManager, conversationManager, outlineManager])
+
+  useEffect(() => {
+    if (!conversationManager || typeof chrome === "undefined") return
+
+    const handler = (
+      message: { type?: string } | undefined,
+      _sender: chrome.runtime.MessageSender,
+      sendResponse: (response: { success: boolean }) => void,
+    ) => {
+      if (message?.type === MSG_CLEAR_ALL_DATA) {
+        conversationManager.destroy()
+        sendResponse({ success: true })
+        return true
+      }
+      return false
+    }
+
+    chrome.runtime.onMessage.addListener(handler)
+    return () => {
+      chrome.runtime.onMessage.removeListener(handler)
+    }
+  }, [conversationManager])
+
+  useEffect(() => {
+    const handleExtensionUpdateAvailable = (event: Event) => {
+      if (window.__OPHEL_EXTENSION_UPDATE_DISMISSED__) return
+
+      const customEvent = event as CustomEvent<{ version?: string }>
+      const nextVersion =
+        customEvent.detail?.version || window.__OPHEL_PENDING_UPDATE_VERSION__ || null
+
+      setExtensionUpdateVersion(nextVersion)
+      setShowExtensionUpdateNotice(true)
+    }
+
+    window.addEventListener(EVENT_EXTENSION_UPDATE_AVAILABLE, handleExtensionUpdateAvailable)
+
+    if (
+      window.__OPHEL_EXTENSION_UPDATE_AVAILABLE__ &&
+      !window.__OPHEL_EXTENSION_UPDATE_DISMISSED__
+    ) {
+      setShowExtensionUpdateNotice(true)
+      setExtensionUpdateVersion(window.__OPHEL_PENDING_UPDATE_VERSION__ || null)
+    }
+
+    return () => {
+      window.removeEventListener(EVENT_EXTENSION_UPDATE_AVAILABLE, handleExtensionUpdateAvailable)
+    }
+  }, [])
+
+  useEffect(() => {
+    window.__OPHEL_EXTENSION_UPDATE_NOTICE_ACTIVE__ = showExtensionUpdateNotice
+
+    if (showExtensionUpdateNotice) {
+      document.getElementById("ophel-extension-update-fallback")?.remove()
+    }
+
+    return () => {
+      window.__OPHEL_EXTENSION_UPDATE_NOTICE_ACTIVE__ = false
+    }
+  }, [showExtensionUpdateNotice])
+
+  const handleDismissExtensionUpdateNotice = useCallback(() => {
+    window.__OPHEL_EXTENSION_UPDATE_DISMISSED__ = true
+    window.__OPHEL_EXTENSION_UPDATE_AVAILABLE__ = false
+    setShowExtensionUpdateNotice(false)
+  }, [])
+
+  const handleReloadAfterExtensionUpdate = useCallback(() => {
+    window.location.reload()
+  }, [])
+
+  useEffect(() => {
+    if (!conversationManager) return
+    conversationManager.updateSettings({
+      syncUnpin: syncUnpin ?? false,
+      syncDelete: syncDelete ?? true,
+    })
+  }, [conversationManager, syncUnpin, syncDelete])
+
+  // 初始化页面内收藏图标
+  useEffect(() => {
+    if (!isSettingsHydrated || !outlineManager || !adapter || !hasSettings) return
+
+    const mode = inlineBookmarkMode || "always"
+    if (!outlineEnabled || mode === "hidden") {
+      InlineBookmarkManager.cleanupInjectedArtifacts()
+      return
+    }
+
+    const inlineBookmarkManager = new InlineBookmarkManager(outlineManager, adapter, mode)
+
+    return () => {
+      inlineBookmarkManager.cleanup()
+    }
+  }, [outlineManager, adapter, outlineEnabled, inlineBookmarkMode, hasSettings, isSettingsHydrated])
+
+  // 滚动锁定切换
+  const handleToggleScrollLock = useCallback(() => {
+    const current = settingsRef.current
+    if (!current) return
+    const newState = !current.panel?.preventAutoScroll
+
+    setSettings({
+      panel: {
+        ...current.panel,
+        preventAutoScroll: newState,
+      },
+    })
+
+    // 简单的提示，实际文案建议放在 useShortcuts或统一管理
+    // 这里暂时使用硬编码中文，后续可优化
+    showToast(newState ? t("preventAutoScrollEnabled") : t("preventAutoScrollDisabled"))
+  }, [setSettings])
+
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState(false)
+
+  const handleFloatingToolbarExport = useCallback(async () => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("exportNeedOpenFirst"))
+      return
+    }
+    // 用户关闭“导出前显示选项弹窗”时，保持按默认格式一键直出
+    if (settings.export?.exportShowDialog === false) {
+      const format = settings.export?.defaultExportFormat ?? "markdown"
+      const success = await conversationManager.exportConversation(sessionId, format)
+      if (!success) {
+        showToast(t("exportFailed"))
+      }
+      return
+    }
+    setIsExportDialogOpen(true)
+  }, [
+    conversationManager,
+    adapter,
+    settings.export?.exportShowDialog,
+    settings.export?.defaultExportFormat,
+  ])
+
+  const handleCustomExport = useCallback(
+    async (format: ExportFormat, options: ConversationExportOptions) => {
+      if (!conversationManager || !adapter) {
+        showToast(t("exportFailed"))
+        return false
+      }
+      const sessionId = adapter.getSessionId()
+      if (!sessionId) {
+        showToast(t("exportNeedOpenFirst"))
+        return false
+      }
+      const success = await conversationManager.exportConversation(sessionId, format, options)
+      if (!success) {
+        showToast(t("exportFailed"))
+      }
+      return success
+    },
+    [conversationManager, adapter],
+  )
+
+  // 会话列表菜单通过事件请求打开导出弹窗（或按设置直出），与工具箱按钮共用同一入口逻辑
+  useEffect(() => {
+    const handleOpenExportDialog = () => {
+      void handleFloatingToolbarExport()
+    }
+    window.addEventListener("ophel:openExportDialog", handleOpenExportDialog)
+    return () => window.removeEventListener("ophel:openExportDialog", handleOpenExportDialog)
+  }, [handleFloatingToolbarExport])
+
+  const handleFloatingToolbarSegmentedExport = useCallback(async () => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("exportNeedOpenFirst"))
+      return
+    }
+
+    setIsSegmentedExporting(true)
+    try {
+      const draft = await conversationManager.prepareSegmentedConversationExport(sessionId)
+      if (!draft || draft.segments.length === 0) {
+        showToast(t("segmentedExportNoSegments"))
+        return
+      }
+
+      setSegmentedExportDraft(draft)
+    } finally {
+      setIsSegmentedExporting(false)
+    }
+  }, [conversationManager, adapter])
+
+  const handleSegmentedExport = useCallback(
+    async (segmentIds: string[], mode: ConversationSegmentedExportMode) => {
+      if (!conversationManager || !segmentedExportDraft) return
+
+      setIsSegmentedExporting(true)
+      try {
+        const success = await conversationManager.exportSegmentedConversation(
+          segmentedExportDraft,
+          segmentIds,
+          mode,
+        )
+        if (success) {
+          setSegmentedExportDraft(null)
+        }
+      } finally {
+        setIsSegmentedExporting(false)
+      }
+    },
+    [conversationManager, segmentedExportDraft],
+  )
+
+  const handleFloatingToolbarMoveToFolder = useCallback(() => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("noConversationToLocate"))
+      return
+    }
+    const conv = conversationManager.getConversation(sessionId)
+    setFloatingToolbarMoveState({
+      convId: sessionId,
+      activeFolderId: conv?.folderId,
+    })
+  }, [conversationManager, adapter])
+
+  const handleFloatingToolbarClearGhost = useCallback(() => {
+    if (!outlineManager) return
+    const cleared = outlineManager.clearGhostBookmarks()
+    if (cleared === 0) {
+      showToast(t("floatingToolbarClearGhostEmpty"))
+      return
+    }
+    showToast(`${t("cleared")} (${cleared})`)
+  }, [outlineManager])
+
+  // 复制为 Markdown 处理器
+  const handleCopyMarkdown = useCallback(async () => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("exportNeedOpenFirst"))
+      return
+    }
+    const success = await conversationManager.exportConversation(sessionId, "clipboard")
+    if (!success) {
+      showToast(t("exportFailed"))
+    }
+  }, [conversationManager, adapter])
+
+  // 工具箱直接导出 HTML 处理器
+  const handleFloatingToolbarHTMLExport = useCallback(async () => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("exportNeedOpenFirst"))
+      return
+    }
+    const success = await conversationManager.exportConversation(sessionId, "html")
+    if (!success) {
+      showToast(t("exportFailed"))
+    }
+  }, [conversationManager, adapter])
+
+  // 模型锁定切换处理器 (按站点)
+  const handleModelLockToggle = useCallback(() => {
+    if (!adapter) return
+    const current = settingsRef.current
+    if (!current) return
+
+    const modelLockConfig = current.modelLock?.[siteInstanceKey] || {
+      enabled: false,
+      keyword: "",
+    }
+
+    // 如果没有配置关键词
+    if (!modelLockConfig.keyword) {
+      if (modelLockConfig.enabled) {
+        // 用户意图是关闭 → 直接关闭，不跳转设置
+        setSettings({
+          modelLock: {
+            ...current.modelLock,
+            [siteInstanceKey]: {
+              ...modelLockConfig,
+              enabled: false,
+            },
+          },
+        })
+        showToast(t("modelLockDisabled"))
+      } else {
+        showToast(t("modelLockNoKeyword"))
+        setSettings({
+          modelLock: {
+            ...current.modelLock,
+            [siteInstanceKey]: {
+              ...modelLockConfig,
+              enabled: true,
+            },
+          },
+        })
+        openSettingsModal()
+        setTimeout(() => {
+          window.dispatchEvent(
+            new CustomEvent("ophel:navigateSettingsPage", {
+              detail: { page: "siteSettings", subTab: "modelLock" },
+            }),
+          )
+        }, 100)
+      }
+      return
+    }
+
+    const newEnabled = !modelLockConfig.enabled
+
+    setSettings({
+      modelLock: {
+        ...current.modelLock,
+        [siteInstanceKey]: {
+          ...modelLockConfig,
+          enabled: newEnabled,
+        },
+      },
+    })
+
+    showToast(newEnabled ? t("modelLockEnabled") : t("modelLockDisabled"))
+  }, [adapter, openSettingsModal, setSettings, siteInstanceKey])
+
+  // 获取当前站点的模型锁定状态
+  const isModelLocked = useMemo(() => {
+    if (!adapter || !settings) return false
+    return settings.modelLock?.[siteInstanceKey]?.enabled || false
+  }, [adapter, settings, siteInstanceKey])
+
+  // 面板统一切换：快捷键与快捷按钮组共用，确保 edge-snap 模式下同步进入 peek 状态
+  const handlePanelToggle = useCallback(() => {
+    hideLauncherPeek()
+    const expanding = !isPanelExpandedRef.current
+    if (expanding && settingsRef.current?.panel?.panelMode === "edge-snap") {
+      // 若 edgeSnapState 为 null（拖拽脱吸附后关闭了面板），恢复到默认边缘位置
+      if (!edgeSnapState) {
+        setEdgeSnapState(
+          (settingsRef.current?.panel?.defaultPosition ?? "right") as "left" | "right",
+        )
+      }
+      showEdgePeek()
+      markSyncAfterOpen()
+    } else if (!expanding) {
+      hideEdgePeek()
+    }
+    persistPanelExpanded(expanding)
+  }, [
+    edgeSnapState,
+    hideEdgePeek,
+    hideLauncherPeek,
+    markSyncAfterOpen,
+    persistPanelExpanded,
+    showEdgePeek,
+  ])
+
+  // 快捷键管理
+  useShortcuts({
+    settings,
+    adapter,
+    outlineManager,
+    conversationManager,
+    onPanelToggle: handlePanelToggle,
+    onThemeToggle: handleThemeToggle,
+    onOpenSettings: openSettingsModal,
+    onOpenGlobalSearch: openGlobalSearchByShortcut,
+    isPanelVisible: isPanelExpanded,
+    isSnapped: !!edgeSnapState && !isEdgePeeking, // 吸附且未显示
+    onShowSnappedPanel: showEdgePeekFromShortcut,
+    onToggleScrollLock: handleToggleScrollLock,
+  })
+
+  // 当面板模式切换时的处理
+  const prevPanelModeForSwitchRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    const panelMode = settings?.panel?.panelMode ?? "floating"
+
+    // 首次渲染时仅记录模式，不执行切换逻辑（初始化由 init useEffect 处理）
+    if (prevPanelModeForSwitchRef.current === undefined) {
+      prevPanelModeForSwitchRef.current = panelMode
+      return
+    }
+    if (prevPanelModeForSwitchRef.current === panelMode) return
+    prevPanelModeForSwitchRef.current = panelMode
+
+    if (panelMode === "edge-snap") {
+      // 切换到吸附模式：只初始化吸附侧边，不改变统一的展开/收起状态
+      const defaultPosition = settings?.panel?.defaultPosition ?? "right"
+      markSuppressOverlayInit(isPanelExpandedRef.current)
+      setEdgeSnapState(defaultPosition)
+      hideEdgePeek()
+    } else {
+      // 切换离开吸附模式：清除吸附视觉状态，不改变统一的展开/收起状态
+      setEdgeSnapState(null)
+      hideEdgePeek()
+    }
+  }, [
+    hideEdgePeek,
+    markSuppressOverlayInit,
+    settings?.panel?.defaultPosition,
+    settings?.panel?.panelMode,
+  ])
+
+  // 监听默认位置变化，重置吸附状态
+  // 当用户切换默认位置（如从左到右）时，如果是吸附状态，需要重置以便面板能跳转到新位置
+  const prevDefaultPosition = useRef(settings?.panel?.defaultPosition)
+  useEffect(() => {
+    const currentPos = settings?.panel?.defaultPosition
+    // 初始化 ref
+    if (prevDefaultPosition.current === undefined && currentPos) {
+      prevDefaultPosition.current = currentPos
+      return
+    }
+
+    if (currentPos && prevDefaultPosition.current !== currentPos) {
+      prevDefaultPosition.current = currentPos
+      // 只有在当前有吸附状态时才需要重置
+      if (edgeSnapState) {
+        // 保持吸附状态，但切换方向
+        setEdgeSnapState(currentPos)
+        hideEdgePeek()
+      }
+    }
+  }, [edgeSnapState, hideEdgePeek, settings?.panel?.defaultPosition])
+
+  const showAiStudioSubmitShortcutSyncToast = useCallback(
+    (submitShortcut: "enter" | "ctrlEnter") => {
+      if (!adapter || adapter.getSiteId() !== SITE_IDS.AISTUDIO) return
+
+      const markerKey = "ophel:aistudio-submit-shortcut-sync-toast"
+      const markerValue = `synced:${submitShortcut}`
+      let shouldShow = true
+
+      try {
+        if (sessionStorage.getItem(markerKey) === markerValue) {
+          shouldShow = false
+        } else {
+          sessionStorage.setItem(markerKey, markerValue)
+        }
+      } catch {
+        // ignore sessionStorage errors
+      }
+
+      if (!shouldShow) return
+
+      const shortcutLabel = submitShortcut === "ctrlEnter" ? "Ctrl + Enter" : "Enter"
+      showToast(`AI Studio ${t("promptSubmitShortcutLabel")}: ${shortcutLabel}`)
+    },
+    [adapter],
+  )
+
+  // Submit shortcut behaviors
+  useEffect(() => {
+    if (!adapter || adapter.getSiteId() !== SITE_IDS.AISTUDIO) return
+
+    const handleShortcutSync = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          submitShortcut?: "enter" | "ctrlEnter"
+          forcedByMobile?: boolean
+        }>
+      ).detail
+      if (detail?.forcedByMobile) return
+
+      const submitShortcut = detail?.submitShortcut
+      if (submitShortcut === "enter" || submitShortcut === "ctrlEnter") {
+        showAiStudioSubmitShortcutSyncToast(submitShortcut)
+      }
+    }
+
+    window.addEventListener(AI_STUDIO_SHORTCUT_SYNC_EVENT, handleShortcutSync as EventListener)
+    return () => {
+      window.removeEventListener(AI_STUDIO_SHORTCUT_SYNC_EVENT, handleShortcutSync as EventListener)
+    }
+  }, [adapter, showAiStudioSubmitShortcutSyncToast])
+
+  // Keep AI Studio local submit-key behavior in sync with extension setting
+  useEffect(() => {
+    if (!adapter || !promptManager || adapter.getSiteId() !== SITE_IDS.AISTUDIO) return
+    promptManager.syncAiStudioSubmitShortcut(promptSubmitShortcut)
+  }, [adapter, promptManager, promptSubmitShortcut])
+
+  // Manual send: trigger only when focused element is the chat input
+  useEffect(() => {
+    if (!adapter || !promptManager) return
+
+    const insertNewLine = (editor: HTMLElement) => {
+      if (editor instanceof HTMLTextAreaElement) {
+        const start = editor.selectionStart ?? editor.value.length
+        const end = editor.selectionEnd ?? editor.value.length
+        editor.setRangeText("\n", start, end, "end")
+        editor.dispatchEvent(new Event("input", { bubbles: true }))
+        return
+      }
+
+      if (editor.getAttribute("contenteditable") !== "true") return
+
+      editor.focus()
+
+      const shiftEnterEvent: KeyboardEventInit = {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        shiftKey: true,
+      }
+
+      const beforeHTML = editor.innerHTML
+      editor.dispatchEvent(new KeyboardEvent("keydown", shiftEnterEvent))
+      editor.dispatchEvent(new KeyboardEvent("keypress", shiftEnterEvent))
+      editor.dispatchEvent(new KeyboardEvent("keyup", shiftEnterEvent))
+
+      // Fallback for editors that ignore synthetic keyboard events.
+      if (editor.innerHTML === beforeHTML) {
+        if (!document.execCommand("insertLineBreak")) {
+          document.execCommand("insertParagraph")
+        }
+        editor.dispatchEvent(new Event("input", { bubbles: true }))
+      }
+    }
+
+    const handleKeydown = (e: KeyboardEvent) => {
+      if (!e.isTrusted) return
+      if (e.key !== "Enter") return
+      if (e.isComposing || e.keyCode === 229) return
+
+      // 防守：如果事件来自队列 overlay 内部，不拦截（让队列自己处理）
+      const path = e.composedPath()
+      const isFromQueue = path.some(
+        (el) =>
+          el instanceof HTMLElement &&
+          (el.classList?.contains("gh-queue-panel") ||
+            el.classList?.contains("gh-queue-input") ||
+            el.classList?.contains("gh-queue-item-edit-input")),
+      )
+      if (isFromQueue) return
+
+      const editor = path.find(
+        (element) => element instanceof HTMLElement && adapter.isValidTextarea(element),
+      ) as HTMLElement | undefined
+
+      if (!editor) return
+
+      const hasAnyModifier = e.ctrlKey || e.metaKey || e.altKey
+      const isPlainEnter = !hasAnyModifier && !e.shiftKey
+      const isCtrlEnterSubmitKey = e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+      const isAiStudioMobilePlainEnter =
+        adapter.getSiteId() === SITE_IDS.AISTUDIO && isLikelyMobileDevice() && isPlainEnter
+      if (isAiStudioMobilePlainEnter) return
+
+      if (promptSubmitShortcut === "enter") {
+        if (isPlainEnter && selectedPrompt) {
+          window.setTimeout(() => setSelectedPrompt(null), 0)
+        }
+        return
+      }
+
+      if (isCtrlEnterSubmitKey) {
+        e.preventDefault()
+        e.stopPropagation()
+        e.stopImmediatePropagation()
+
+        const submitted = promptManager.submitCurrentInputImmediately(promptSubmitShortcut)
+        if (submitted) {
+          setSelectedPrompt(null)
+        }
+        return
+      }
+
+      // In Ctrl+Enter mode, block plain Enter to avoid accidental native submit
+      if (isPlainEnter) {
+        e.preventDefault()
+        e.stopPropagation()
+        e.stopImmediatePropagation()
+        insertNewLine(editor)
+      }
+    }
+
+    // Claude 特殊处理：在部分页面中，站点自身会较早消费 Enter，
+    // document 捕获阶段可能已来不及拦截（表现为 Ctrl+Enter 模式下 Enter 仍触发发送）。
+    // 因此 Claude 使用 window 捕获监听以提前拦截。
+    // 注意：这里 return 后不会再注册 document 监听，不会双重挂载。
+    if (adapter.getSiteId() === SITE_IDS.CLAUDE) {
+      window.addEventListener("keydown", handleKeydown, true)
+      return () => {
+        window.removeEventListener("keydown", handleKeydown, true)
+      }
+    }
+
+    // 其他站点保持原有 document 捕获监听，避免扩大行为影响面。
+    document.addEventListener("keydown", handleKeydown, true)
+    return () => {
+      document.removeEventListener("keydown", handleKeydown, true)
+    }
+  }, [adapter, promptManager, promptSubmitShortcut, selectedPrompt])
+
+  // Clear selected prompt tag after clicking native send button
+  useEffect(() => {
+    if (!adapter || !selectedPrompt) return
+
+    const handleSend = () => {
+      setSelectedPrompt(null)
+    }
+
+    const handleClick = (e: MouseEvent) => {
+      const selectors = adapter.getSubmitButtonSelectors()
+      if (selectors.length === 0) return
+
+      const path = e.composedPath()
+      for (const target of path) {
+        if (target === document || target === window) break
+        for (const selector of selectors) {
+          try {
+            if ((target as Element).matches?.(selector)) {
+              setTimeout(handleSend, 100)
+              return
+            }
+          } catch {
+            // ignore invalid selectors
+          }
+        }
+      }
+    }
+
+    document.addEventListener("click", handleClick, true)
+
+    return () => {
+      document.removeEventListener("click", handleClick, true)
+    }
+  }, [adapter, selectedPrompt])
+
+  // 切换会话时自动清空选中的提示词悬浮条及输入框
+  useEffect(() => {
+    if (!selectedPrompt || !adapter) return
+
+    // 清空悬浮条和输入框
+    const clearPromptAndTextarea = () => {
+      setSelectedPrompt(null)
+      // 同时清空输入框（adapter.clearTextarea 内部有校验，不会误选全页面）
+      adapter.clearTextarea()
+    }
+
+    window.addEventListener(EVENT_PAGE_URL_CHANGE, clearPromptAndTextarea)
+
+    return () => {
+      window.removeEventListener(EVENT_PAGE_URL_CHANGE, clearPromptAndTextarea)
+    }
+  }, [selectedPrompt, adapter])
+
+  // 浮动工具栏设置标签状态
+  const [floatingToolbarTagState, setFloatingToolbarTagState] = useState<{
+    convId: string
+  } | null>(null)
+
+  const handleFloatingToolbarSetTag = useCallback(() => {
+    if (!conversationManager || !adapter) return
+    const sessionId = adapter.getSessionId()
+    if (!sessionId) {
+      showToast(t("noConversationToLocate"))
+      return
+    }
+    setFloatingToolbarTagState({
+      convId: sessionId,
+    })
+  }, [conversationManager, adapter])
+
+  const { tags, addTag, updateTag, deleteTag } = useTagsStore()
+
+  const handleToggleGlobalSearchGroup = useCallback(
+    (category: GlobalSearchResultCategory) => {
+      setSettingsSearchNavigationMode("pointer")
+      setExpandedGlobalSearchCategories((prev) => ({
+        ...prev,
+        [category]: !prev[category],
+      }))
+    },
+    [setExpandedGlobalSearchCategories, setSettingsSearchNavigationMode],
+  )
+
+  const extensionUpdateKickerText = getLocalizedText({
+    key: "extensionUpdateNoticeKicker",
+    fallback: "Extension updated",
+  })
+  const extensionUpdateDescription = extensionUpdateVersion
+    ? formatLocalizedText(
+        {
+          key: "extensionUpdateNoticeWithVersion",
+          fallback: `${APP_DISPLAY_NAME} has been updated to v{version}. Reload this page to keep using the latest version.`,
+        },
+        { version: extensionUpdateVersion },
+      )
+    : getLocalizedText({
+        key: "extensionUpdateNotice",
+        fallback: `${APP_DISPLAY_NAME} has been updated. Reload this page to keep using the latest version.`,
+      })
+  const extensionUpdateActionLabel = getLocalizedText({
+    key: "extensionUpdateNoticeAction",
+    fallback: "Reload page",
+  })
+  const extensionUpdateCloseLabel = t("close")
+  const exportOverlayText = exportProgress
+    ? t(
+        (exportProgress.operation === "outline-copy"
+          ? OUTLINE_COPY_STAGE_TEXT_KEYS
+          : EXPORT_STAGE_TEXT_KEYS)[exportProgress.stage],
+      )
+    : ""
+  const exportOverlayHint = t(
+    exportProgress?.operation === "outline-copy" ? "outlineCopyOverlayHint" : "exportOverlayHint",
+  )
+
+  const outlineRoleLabels = useMemo(
+    () => ({
+      query: getLocalizedText({ key: "outlineUserQueryRoleLabel", fallback: "User queries" }),
+      reply: getLocalizedText({ key: "globalSearchOutlineReplies", fallback: "Replies" }),
+    }),
+    [getLocalizedText],
+  )
+
+  const offsiteConversationLabel = getLocalizedText({
+    key: "globalSearchOffsiteConversation",
+    fallback: "External",
+  })
+
+  const renderSearchResultItem = (item: GlobalSearchResultItem, index: number) => (
+    <GlobalSearchResultItemView
+      key={item.id}
+      item={item}
+      index={index}
+      optionIdPrefix={GLOBAL_SEARCH_OPTION_ID_PREFIX}
+      isActive={index === settingsSearchActiveIndex}
+      highlightTokens={settingsSearchHighlightTokens}
+      outlineRoleLabels={outlineRoleLabels}
+      matchReasonLabels={resolvedGlobalSearchMatchReasonLabels}
+      offsiteConversationLabel={offsiteConversationLabel}
+      onMouseMove={() => {
+        setSettingsSearchNavigationMode("pointer")
+
+        if (Date.now() < settingsSearchWheelFreezeUntilRef.current) {
+          return
+        }
+
+        if (settingsSearchHoverLocked) {
+          setSettingsSearchHoverLocked(false)
+          return
+        }
+        setSettingsSearchActiveIndex(index)
+      }}
+      onMouseEnter={(event) => {
+        setSettingsSearchNavigationMode("pointer")
+        scheduleGlobalSearchPointerPreview({
+          item,
+          anchorElement: event.currentTarget,
+        })
+      }}
+      onMouseLeave={() => {
+        scheduleHideGlobalSearchPromptPreview()
+      }}
+      onClick={() => navigateToSearchResult(item)}
+    />
+  )
+
+  if (!adapter || !promptManager || !conversationManager || !outlineManager) {
+    return null
+  }
+
+  const edgeTriggerMode = settings?.panel?.edgeTriggerMode ?? DEFAULT_SETTINGS.panel.edgeTriggerMode
+  const shouldRenderEdgeHoverZone =
+    isPanelExpanded &&
+    Boolean(edgeSnapState) &&
+    (settings?.panel?.panelMode ?? "floating") === "edge-snap" &&
+    edgeTriggerMode === "hidden" &&
+    !isLauncherPeeking &&
+    !isSettingsOpen
+
+  return (
+    <div className={`gh-root ${isPassThrough ? "gh-pass-through" : ""}`}>
+      {shouldRenderEdgeHoverZone && edgeSnapState && (
+        <div
+          aria-hidden="true"
+          className={`gh-edge-hover-zone gh-interactive ${edgeSnapState}`}
+          onMouseEnter={handleEdgeHoverZoneMouseEnter}
+          onMouseLeave={handleEdgeHoverZoneMouseLeave}
+        />
+      )}
+
+      <MainPanel
+        isOpen={isPanelExpanded || isLauncherPeeking}
+        isLauncherPeeking={isLauncherPeeking}
+        launcherPeekAnchorRect={launcherPeekAnchorRect}
+        onClose={() => {
+          hideLauncherPeek()
+          hideEdgePeek()
+          persistPanelExpanded(false)
+        }}
+        promptManager={promptManager}
+        conversationManager={conversationManager}
+        outlineManager={outlineManager}
+        adapter={adapter}
+        onThemeToggle={handleThemeToggle}
+        themeMode={themeMode}
+        selectedPromptId={selectedPrompt?.id}
+        onPromptSelect={handlePromptSelect}
+        edgeSnapState={edgeSnapState}
+        isEdgePeeking={isEdgePeeking}
+        onEdgeSnap={(side) => setEdgeSnapState(side)}
+        onUnsnap={() => {
+          setEdgeSnapState(null)
+          hideEdgePeek()
+        }}
+        onInteractionStateChange={handlePanelInteractionChange}
+        isHoverWidthSettingsPreviewActive={isHoverWidthSettingsPreviewActive}
+        hoverWidthReleaseToken={hoverWidthReleaseToken}
+        onOpenSettings={() => {
+          openSettingsModal()
+        }}
+        hasUnseenReleaseNotes={
+          canShowCurrentReleaseNotes &&
+          Boolean(releaseNotesMarkdown.trim()) &&
+          hasUnseenReleaseNotes
+        }
+        onOpenReleaseNotes={canShowCurrentReleaseNotes ? openReleaseNotes : undefined}
+        releaseNotesTitleText={releaseNotesTitleText}
+        releaseNotesPreview={releaseNotesPreview}
+        onMouseEnter={handleMainPanelMouseEnter}
+        onMouseLeave={handleMainPanelMouseLeave}
+      />
+
+      <QuickButtons
+        isPanelExpanded={isPanelExpanded}
+        hasUnseenReleaseNotes={
+          canShowCurrentReleaseNotes &&
+          Boolean(releaseNotesMarkdown.trim()) &&
+          hasUnseenReleaseNotes
+        }
+        onPanelToggle={handlePanelToggle}
+        onPanelLogoHoverStart={handlePanelLogoHoverStart}
+        onPanelLogoHoverEnd={handlePanelLogoHoverEnd}
+        onThemeToggle={handleThemeToggle}
+        themeMode={themeMode}
+        onExport={handleFloatingToolbarExport}
+        onMove={handleFloatingToolbarMoveToFolder}
+        onSetTag={handleFloatingToolbarSetTag}
+        onScrollLock={() => handleToggleScrollLock()}
+        onSettings={() => {
+          // 打开 SettingsModal 并跳转到工具箱设置 Tab
+          openSettingsModal()
+          // 延迟发送导航事件，确保 Modal 已挂载
+          setTimeout(() => {
+            window.dispatchEvent(
+              new CustomEvent("ophel:navigateSettingsPage", {
+                detail: { page: "general", subTab: "toolsMenu" },
+              }),
+            )
+          }, 50)
+        }}
+        scrollLocked={isScrollLockActive}
+        onCleanup={() => {
+          if (ghostBookmarkCount === 0) {
+            showToast(t("floatingToolbarClearGhostEmpty"))
+            return
+          }
+          setIsFloatingToolbarClearOpen(true)
+        }}
+        onGlobalSearch={openGlobalSettingsSearch}
+        onCopyMarkdown={handleCopyMarkdown}
+        onExportHTML={handleFloatingToolbarHTMLExport}
+        onSegmentedExport={handleFloatingToolbarSegmentedExport}
+        onModelLockToggle={handleModelLockToggle}
+        isModelLocked={isModelLocked}
+        onOpenSettings={openSettingsModal}
+      />
+      {/* 选中提示词悬浮条 */}
+      {selectedPrompt && (
+        <SelectedPromptBar
+          title={selectedPrompt.title}
+          onClear={handleClearSelectedPrompt}
+          adapter={adapter}
+        />
+      )}
+      {/* 设置模态框 */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={closeSettingsModal}
+        adapter={adapter}
+        onOpenReleaseNotes={canShowCurrentReleaseNotes ? openReleaseNotes : undefined}
+        onPanelHoverWidthPreviewChange={setIsHoverWidthSettingsPreviewActive}
+      />
+      {isReleaseNotesOpen && canShowCurrentReleaseNotes && releaseNotesMarkdown.trim() ? (
+        <ReleaseNotesModal
+          version={currentReleaseNotes.version}
+          date={currentReleaseNotes.date}
+          markdown={releaseNotesMarkdown}
+          language={releaseNotesLanguage}
+          media={currentReleaseNotes.media}
+          fullChangelogUrl={fullChangelogUrl}
+          onClose={closeReleaseNotes}
+          onOpenFullChangelog={openFullChangelog}
+        />
+      ) : null}
+      {segmentedExportDraft && (
+        <SegmentedExportDialog
+          draft={segmentedExportDraft}
+          isExporting={isSegmentedExporting}
+          onCancel={() => {
+            if (!isSegmentedExporting) {
+              setSegmentedExportDraft(null)
+            }
+          }}
+          onExport={handleSegmentedExport}
+        />
+      )}
+      <ExportDialog
+        isOpen={isExportDialogOpen}
+        onClose={() => setIsExportDialogOpen(false)}
+        onExport={handleCustomExport}
+        onSegmentedExport={handleFloatingToolbarSegmentedExport}
+      />
+      <GlobalSearchOverlay
+        isOpen={isGlobalSettingsSearchOpen}
+        onClose={() => {
+          hideGlobalSearchPromptPreview()
+          closeGlobalSettingsSearch()
+        }}
+        inputRef={settingsSearchInputRef}
+        resultsRef={settingsSearchResultsRef}
+        activeOptionId={activeGlobalSearchOptionId}
+        inputValue={settingsSearchInputValue}
+        inputPlaceholder={
+          globalSearchPrimaryShortcutLabel
+            ? `${resolvedActiveGlobalSearchCategoryText.placeholder}（${globalSearchPrimaryShortcutLabel}）`
+            : resolvedActiveGlobalSearchCategoryText.placeholder
+        }
+        onInputChange={(nextValue) => {
+          commitSettingsSearchInputValue(nextValue)
+          setActiveSearchSyntaxSuggestionIndex(-1)
+          setSettingsSearchActiveIndex(0)
+          const normalizedValue = nextValue.trimStart()
+
+          if (normalizedValue.startsWith("tip:") && activeGlobalSearchCategory !== "tips") {
+            setActiveGlobalSearchCategory("tips")
+          } else if (!normalizedValue.startsWith("tip:") && activeGlobalSearchCategory === "tips") {
+            setActiveGlobalSearchCategory("all")
+          }
+        }}
+        hotkeyLabel={globalSearchOverlayHotkeyLabel}
+        fuzzySearchToggleLabel={getLocalizedText({
+          key: "globalSearchFuzzySearchToggle",
+          fallback: "Fuzzy",
+        })}
+        fuzzySearchToggleAriaLabel={getLocalizedText({
+          key: "globalSearchFuzzySearchToggleAria",
+          fallback: "Toggle fuzzy search",
+        })}
+        isFuzzySearchEnabled={isGlobalSearchFuzzySearchEnabled}
+        onToggleFuzzySearch={toggleGlobalSearchFuzzySearch}
+        syntaxHelpTriggerRef={globalSearchSyntaxHelpTriggerRef}
+        syntaxHelpPopoverRef={globalSearchSyntaxHelpPopoverRef}
+        showSyntaxHelp={showGlobalSearchSyntaxHelp}
+        onToggleSyntaxHelp={() => setShowGlobalSearchSyntaxHelp((previous) => !previous)}
+        syntaxHelpTriggerAriaLabel={getLocalizedText({
+          key: "globalSearchSyntaxHelpTriggerAria",
+          fallback: "Open search syntax help",
+        })}
+        syntaxHelpTitle={globalSearchSyntaxHelpTitle}
+        syntaxHelpDescription={globalSearchSyntaxHelpDescription}
+        syntaxHelpItems={globalSearchSyntaxHelpItems}
+        onApplySyntaxHelpItem={applyGlobalSearchSyntaxHelpItem}
+        activeFilterChips={activeGlobalSearchFilterChips}
+        hasOverflowFilterChips={hasOverflowGlobalSearchFilterChips}
+        overflowFilterChipText={formatLocalizedText(
+          {
+            key: "globalSearchSyntaxChipOverflow",
+            fallback: "+{count} more",
+          },
+          {
+            count: String(
+              activeGlobalSearchSyntaxFilters.length - GLOBAL_SEARCH_FILTER_CHIP_MAX_COUNT,
+            ),
+          },
+        )}
+        filterChipRemoveTitle={getLocalizedText({
+          key: "globalSearchSyntaxChipRemove",
+          fallback: "Click to remove filter",
+        })}
+        clearFiltersLabel={getLocalizedText({ key: "clear", fallback: "Clear" })}
+        onRemoveFilterChip={handleRemoveGlobalSearchFilterChip}
+        onClearAllFilterChips={clearAllGlobalSearchSyntaxFilters}
+        shouldShowSyntaxSuggestions={shouldShowGlobalSearchSyntaxSuggestions}
+        syntaxSuggestions={globalSearchSyntaxSuggestions}
+        activeSyntaxSuggestionIndex={activeSearchSyntaxSuggestionIndex}
+        onHoverSyntaxSuggestion={setActiveSearchSyntaxSuggestionIndex}
+        onApplySyntaxSuggestion={applyGlobalSearchSyntaxSuggestion}
+        syntaxDiagnostics={activeGlobalSearchSyntaxDiagnostics}
+        resolveSyntaxDiagnosticTitle={(code) =>
+          globalSearchSyntaxDiagnosticMessages[
+            code as keyof typeof globalSearchSyntaxDiagnosticMessages
+          ] || globalSearchSyntaxDiagnosticMessages.invalidValue
+        }
+        showShortcutNudge={showGlobalSearchShortcutNudge}
+        shortcutNudgeMessage={globalSearchShortcutNudgeMessage}
+        closeLabel={getLocalizedText({ key: "close", fallback: "Close" })}
+        dismissShortcutNudgeLabel={getLocalizedText({
+          key: "globalSearchShortcutNudgeDismiss",
+          fallback: "Don’t remind me",
+        })}
+        onHideShortcutNudge={hideGlobalSearchShortcutNudge}
+        onDismissShortcutNudgeForever={dismissGlobalSearchShortcutNudgeForever}
+        categoriesLabel={getLocalizedText({
+          key: "globalSearchCategoriesLabel",
+          fallback: "Global search categories",
+        })}
+        categories={GLOBAL_SEARCH_CATEGORY_DEFINITIONS.map((category) => ({
+          id: category.id,
+          label: resolvedGlobalSearchCategoryLabels[category.id],
+          count:
+            category.id === "tips" && activeGlobalSearchCategory !== "tips"
+              ? null
+              : globalSearchResultCounts[category.id],
+        }))}
+        activeCategoryId={activeGlobalSearchCategory}
+        onSelectCategory={(categoryId) => {
+          setActiveGlobalSearchCategory(categoryId)
+          setSettingsSearchActiveIndex(0)
+        }}
+        activeContext={activeGlobalSearchContext}
+        listboxId={GLOBAL_SEARCH_RESULTS_LISTBOX_ID}
+        listboxLabel={globalSearchListboxLabel}
+        onResultsWheel={() => {
+          setSettingsSearchNavigationMode("pointer")
+          settingsSearchWheelFreezeUntilRef.current = Date.now() + 200
+          hideGlobalSearchPromptPreview()
+        }}
+        visibleResults={visibleGlobalSearchResults}
+        groupedResults={groupedGlobalSearchResults}
+        getGroupLabel={(categoryId) => resolvedGlobalSearchResultCategoryLabels[categoryId]}
+        allCategoryItemLimit={GLOBAL_SEARCH_ALL_CATEGORY_ITEM_LIMIT}
+        isAllCategory={activeGlobalSearchCategory === "all"}
+        emptyText={resolvedActiveGlobalSearchCategoryText.emptyText}
+        emptyGuideTitle={getLocalizedText({
+          key: "globalSearchSyntaxEmptyGuideTitle",
+          fallback: "Try search filters",
+        })}
+        emptyGuideDescription={getLocalizedText({
+          key: "globalSearchSyntaxEmptyGuideDesc",
+          fallback: "Use filter syntax to narrow results quickly",
+        })}
+        emptyGuideExamples={[
+          {
+            id: "example:type-prompts",
+            token: "type:prompts",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:type-prompts",
+                token: "type:prompts",
+                label: "type:prompts",
+                description: "",
+              }),
+          },
+          {
+            id: "example:is-pinned",
+            token: "is:pinned",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:is-pinned",
+                token: "is:pinned",
+                label: "is:pinned",
+                description: "",
+              }),
+          },
+          {
+            id: "example:folder-inbox",
+            token: "folder:inbox",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:folder-inbox",
+                token: "folder:inbox",
+                label: "folder:inbox",
+                description: "",
+              }),
+          },
+          {
+            id: "example:tag-work",
+            token: "tag:work",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:tag-work",
+                token: "tag:work",
+                label: "tag:work",
+                description: "",
+              }),
+          },
+          {
+            id: "example:level-0",
+            token: "level:0",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:level-0",
+                token: "level:0",
+                label: "level:0",
+                description: "",
+              }),
+          },
+          {
+            id: "example:date-7d",
+            token: "date:7d",
+            onClick: () =>
+              applyGlobalSearchSyntaxSuggestion({
+                id: "example:date-7d",
+                token: "date:7d",
+                label: "date:7d",
+                description: "",
+              }),
+          },
+        ]}
+        renderSearchResultItem={renderSearchResultItem}
+        resolveVisibleResultIndex={(item, fallbackIndex) =>
+          visibleSearchResultIndexMap.get(item.id) ?? fallbackIndex
+        }
+        collapseLabel={getLocalizedText({ key: "collapse", fallback: "Collapse" })}
+        moreLabel={getLocalizedText({ key: "floatingToolbarMore", fallback: "More" })}
+        onToggleCategoryGroup={handleToggleGlobalSearchGroup}
+        footerTips={getLocalizedText({
+          key: "globalSearchFooterTips",
+          fallback: "Enter to jump · ↑↓ to select · Tab category · Esc to close",
+        })}
+        promptPreview={
+          globalSearchPromptPreview && globalSearchPromptPreviewPosition ? (
+            <>
+              <div
+                ref={promptPreviewContainerRef}
+                className="settings-search-prompt-preview-float gh-markdown-preview"
+                style={{
+                  top: globalSearchPromptPreviewPosition.top,
+                  left: globalSearchPromptPreviewPosition.left,
+                }}
+                onMouseEnter={() => {
+                  clearPromptPreviewTimer()
+                  clearPromptPreviewHideTimer()
+                }}
+                onMouseLeave={() => {
+                  scheduleHideGlobalSearchPromptPreview()
+                }}
+                onClick={handleGlobalSearchPromptPreviewClick}
+                dangerouslySetInnerHTML={{
+                  __html: createSafeHTML(renderMarkdown(globalSearchPromptPreview.content, false)),
+                }}
+              />
+              <style>{getHighlightStyles()}</style>
+            </>
+          ) : undefined
+        }
+      />
+      {floatingToolbarMoveState && (
+        <FolderSelectDialog
+          folders={conversationManager.getFolders()}
+          excludeFolderId={
+            conversationManager.getConversation(floatingToolbarMoveState.convId)?.folderId
+          }
+          activeFolderId={floatingToolbarMoveState.activeFolderId}
+          onSelect={async (folderId) => {
+            await conversationManager.moveConversation(floatingToolbarMoveState.convId, folderId)
+            setFloatingToolbarMoveState(null)
+          }}
+          onCancel={() => setFloatingToolbarMoveState(null)}
+        />
+      )}
+      {floatingToolbarTagState && (
+        <TagManagerDialog
+          tags={tags}
+          conv={conversationManager.getConversation(floatingToolbarTagState.convId)}
+          onCancel={() => setFloatingToolbarTagState(null)}
+          onCreateTag={async (name, color) => {
+            return addTag(name, color)
+          }}
+          onUpdateTag={async (tagId, name, color) => {
+            return updateTag(tagId, name, color)
+          }}
+          onDeleteTag={async (tagId) => {
+            deleteTag(tagId)
+          }}
+          onSetConversationTags={async (convId, tagIds) => {
+            await conversationManager.updateConversation(convId, { tagIds })
+          }}
+          onRefresh={() => {
+            // 强制刷新会话列表 ? conversationManager 会触发 onChange
+          }}
+        />
+      )}
+      {isFloatingToolbarClearOpen && (
+        <ConfirmDialog
+          title={t("floatingToolbarClearGhost")}
+          message={t("floatingToolbarClearGhostConfirm").replace(
+            "{count}",
+            String(ghostBookmarkCount),
+          )}
+          danger
+          onConfirm={() => {
+            setIsFloatingToolbarClearOpen(false)
+            handleFloatingToolbarClearGhost()
+          }}
+          onCancel={() => setIsFloatingToolbarClearOpen(false)}
+        />
+      )}
+      {adapter && queueDispatcher && (settings?.features?.prompts?.promptQueue ?? false) && (
+        <QueueOverlay adapter={adapter} dispatcher={queueDispatcher} />
+      )}
+      {adapter && promptManager && (settings?.features?.prompts?.enabled ?? true) && (
+        <QuickQuoteActions adapter={adapter} promptManager={promptManager} />
+      )}
+      <LoadingOverlay
+        isVisible={Boolean(exportProgress)}
+        text={exportOverlayText}
+        hint={exportOverlayHint}
+        tone="export"
+        blockPageInteraction
+      />
+      {showReleaseNotesToast && canShowCurrentReleaseNotes && (
+        <section
+          className="gh-release-toast gh-interactive"
+          role="status"
+          aria-live="polite"
+          onMouseEnter={pauseReleaseNotesToast}
+          onMouseLeave={resumeReleaseNotesToast}>
+          <button
+            type="button"
+            className="gh-release-toast-close"
+            aria-label={t("close")}
+            onClick={dismissReleaseNotesToast}>
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+          <div className="gh-release-toast-title">
+            <svg
+              className="gh-release-toast-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+            </svg>
+            {releaseNotesTitleText}
+          </div>
+          {releaseNotesPreview ? (
+            <p className="gh-release-toast-preview">{releaseNotesPreview}</p>
+          ) : null}
+          <div className="gh-release-toast-actions">
+            <button
+              type="button"
+              className="gh-release-toast-button"
+              onClick={openReleaseNotesFromToast}>
+              {t("releaseNotesOpen")}
+            </button>
+          </div>
+        </section>
+      )}
+      {showExtensionUpdateNotice && (
+        <section className="gh-update-notice gh-interactive" role="status" aria-live="polite">
+          <button
+            type="button"
+            className="gh-update-notice-close"
+            aria-label={extensionUpdateCloseLabel}
+            onClick={handleDismissExtensionUpdateNotice}>
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+          <div className="gh-update-notice-kicker">
+            <svg
+              className="gh-update-notice-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+            </svg>
+            {extensionUpdateKickerText}
+          </div>
+          <p className="gh-update-notice-message">{extensionUpdateDescription}</p>
+          <div className="gh-update-notice-actions">
+            <button
+              type="button"
+              className="gh-update-notice-button gh-update-notice-button--primary"
+              onClick={handleReloadAfterExtensionUpdate}>
+              {extensionUpdateActionLabel}
+            </button>
+          </div>
+        </section>
+      )}
+      <DisclaimerModal />
+    </div>
+  )
+}

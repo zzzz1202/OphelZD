@@ -1,0 +1,2163 @@
+/**
+ * 站点适配器基类
+ *
+ * 每个支持的站点（Gemini/ChatGPT/Claude 等）需要继承此类并实现抽象方法
+ */
+
+import { SITE_IDS } from "~constants/defaults"
+import type { MarkdownFixerConfig } from "~core/markdown-fixer"
+import { extractConversationTitleFromDocumentTitle } from "~utils/conversation-title"
+import { DOMToolkit } from "~utils/dom-toolkit"
+import { createExportAssetCollector, type ExportAssetCollector } from "~utils/export-assets"
+import type { ExportBundle, ExportFormat, ExportMessage } from "~utils/exporter"
+import { createSiteInstanceKey } from "~utils/site-identity"
+import type { ExportPackaging } from "~utils/storage"
+
+import { getBuiltinFeatureCapabilities, type SitePackCapability } from "./feature-capabilities"
+
+// ==================== 类型定义 ====================
+
+export type { MarkdownFixerConfig }
+
+export interface OutlineItem {
+  level: number
+  text: string
+  element: Element | null
+  isUserQuery?: boolean
+  isTruncated?: boolean
+  id?: string
+  /** Navigation-only target id; bookmark signatures should continue to use id. */
+  navigationId?: string
+  context?: string
+  wordCount?: number
+}
+
+export type OutlineSourceKind = "conversation" | "document"
+
+export interface OutlineSource {
+  id: string
+  kind: OutlineSourceKind
+  label: string
+  available: boolean
+  count?: number
+}
+
+export interface ConversationInfo {
+  id: string
+  title: string
+  url: string
+  isActive?: boolean
+  isPinned?: boolean
+  cid?: string
+}
+
+export interface ConversationDeleteTarget {
+  id: string
+  title?: string
+  url?: string
+}
+
+export interface SiteDeleteConversationResult {
+  id: string
+  success: boolean
+  method: "api" | "ui" | "none"
+  reason?: string
+  learnedApiTemplate?: boolean
+}
+
+export interface NetworkMonitorConfig {
+  urlPatterns: string[]
+  urlPathEndsWith?: string[]
+  silenceThreshold: number
+  requestBodyRules?: NetworkMonitorRequestBodyRule[]
+}
+
+export interface NetworkMonitorRequestBodyRule {
+  type: "json-field-exists"
+  field: string
+  metadata: Record<string, string | number | boolean | null>
+}
+
+export interface ModelSwitcherConfig {
+  targetModelKeyword: string
+  selectorButtonSelectors: string[]
+  menuItemSelector: string
+  checkInterval?: number
+  maxAttempts?: number
+  menuRenderDelay?: number
+  /** 子菜单触发关键字（可选），如 ["more models", "更多模型", "传统", "legacy"] */
+  subMenuTriggers?: string[]
+  /** 子菜单选择器（可选），用于语言无关匹配，如 '[aria-haspopup="menu"]' */
+  subMenuSelector?: string
+}
+
+export interface ExportConfig {
+  userQuerySelector: string
+  assistantResponseSelector: string
+  turnSelector: string | null
+  useShadowDOM: boolean
+}
+
+export interface ExportLifecycleContext {
+  conversationId: string
+  format: ExportFormat
+  includeThoughts: boolean
+  packaging: ExportPackaging
+}
+
+/**
+ * 导出采集完整性报告。
+ *
+ * 虚拟滚动站点在 prepareConversationExport 中采集消息时生成，
+ * 供 ConversationManager 判断是否需要补扫或向用户提示"导出可能不完整"。
+ * 无法提供完整性判定的站点保持默认 null，行为与现状一致。
+ */
+export interface ExportCollectionReport {
+  /** 站点锚点序列给出的应有锚点总数；无法获知时为 null */
+  expectedCount: number | null
+  /** 实际采集到的锚点数 */
+  collectedCount: number
+  /** 连续性校验发现的缺口描述（如缺失的 turn-N / 行号），无校验能力时为空数组 */
+  missingAnchors: string[]
+  /** 是否有内容疑似截断的条目（抓到了但可能不全） */
+  hasTruncated: boolean
+}
+
+export interface ConversationObserverConfig {
+  selector: string
+  shadow: boolean
+  extractInfo: (el: Element) => ConversationInfo | null
+  getTitleElement: (el: Element) => Element | null
+}
+
+export interface AnchorData {
+  type: "selector" | "index"
+  selector?: string
+  index?: number
+  offset: number
+  textSignature?: string
+}
+
+export interface FormulaCopySource {
+  latex?: string
+  mathml?: string
+  isBlock?: boolean
+}
+
+export interface ZenModeStyleRule {
+  selector: string
+  property: string
+  value: string
+  globalSelector?: string
+  extraCss?: string
+}
+
+export interface ZenModeRootClassConfig {
+  selector: string
+  className: string
+}
+
+export interface ZenModeConfig {
+  hide?: string[]
+  rootClass?: ZenModeRootClassConfig
+  styles?: ZenModeStyleRule[]
+}
+
+export interface WidthSelectorConfig {
+  selector: string
+  property: string
+  globalSelector?: string
+  value?: string
+  transformValue?: (value: string) => string
+  extraCss?: string
+  noCenter?: boolean
+}
+
+export interface PanelAvoidanceInsetConfig {
+  selector: string
+  /** 可选：该 inset 目标使用独立 scope 计算避让量；未设置时复用主 scope。 */
+  scopeSelector?: string
+  /** 可选：覆盖主配置的宿主障碍物；空数组表示该 inset 只避让 Ophel 面板。 */
+  obstacleSelectors?: string[]
+  /** 只应用某一侧 inset；默认同时应用左右两侧。 */
+  applySide?: "both" | "left" | "right"
+  /** centered 会包含内容居中余量；edge 只使用避让面板所需的边缘余量。 */
+  insetMode?: "centered" | "edge"
+  leftProperty?: string
+  rightProperty?: string
+  extraCss?: string
+}
+
+export interface PanelAvoidanceConfig {
+  /** 用于计算安全区的宿主页内容容器；未设置时按整个 viewport 计算。 */
+  scopeSelector?: string
+  /** 宿主页面自己打开的右侧/左侧面板；存在时和 Ophel 面板一起扣除安全区。 */
+  obstacleSelectors?: string[]
+  /** 需要按扣除 Ophel 面板后的安全区域重算宽度的站点选择器。 */
+  widthSelectors: WidthSelectorConfig[]
+  /** 需要按安全区中心重新分配左右 inset 的站点选择器。 */
+  insetSelectors?: PanelAvoidanceInsetConfig[]
+  /** Page Widening 未开启时用于避免无意加宽宿主页的站点默认宽度。 */
+  defaultWidth?: string
+  /** 面板和内容之间保留的视觉间距，单位 px。 */
+  gap?: number
+  /** 小于该可见宽度时视为 edge-snap 把手或收起态，不触发避让。 */
+  minVisiblePanelWidth?: number
+  /** 安全区过窄时不强行避让，避免把正文压到不可读。 */
+  minSafeWidth?: number
+  /** 小于该视口宽度时禁用避让，避免手机和窄屏设备被进一步压缩。 */
+  minViewportWidth?: number
+}
+
+export interface LayoutCapability {
+  getWidthSelectors?: () => WidthSelectorConfig[]
+  getUserQueryWidthSelectors?: () => WidthSelectorConfig[]
+  getPanelAvoidanceConfig?: () => PanelAvoidanceConfig | null
+}
+
+export interface AdapterCapabilities {
+  layout?: LayoutCapability
+}
+
+export type AssistantMermaidSupportMode = "native" | "fallback" | "unsupported"
+export type QuickQuoteSupportMode = "enabled" | "native" | "disabled"
+
+export interface AssistantMermaidBlock {
+  element: HTMLElement
+  source: string
+}
+
+const ASSISTANT_MERMAID_SOURCE_PATTERNS = [
+  /^flowchart\b/i,
+  /^graph\b/i,
+  /^sequenceDiagram\b/i,
+  /^classDiagram(?:-v2)?\b/i,
+  /^stateDiagram(?:-v2)?\b/i,
+  /^erDiagram\b/i,
+  /^gantt\b/i,
+  /^gitGraph\b/i,
+]
+
+const ASSISTANT_MERMAID_SOURCE_NORMALIZERS = [
+  { pattern: /^flow\s*-?\s*chart\b/i, replacement: "flowchart" },
+  { pattern: /^sequence\s*-?\s*diagram\b/i, replacement: "sequenceDiagram" },
+  { pattern: /^class\s*-?\s*diagram(?:\s*-\s*|\s+)v2\b/i, replacement: "classDiagram-v2" },
+  { pattern: /^class\s*-?\s*diagram\b/i, replacement: "classDiagram" },
+  { pattern: /^state\s*-?\s*diagram(?:\s*-\s*|\s+)v2\b/i, replacement: "stateDiagram-v2" },
+  { pattern: /^state\s*-?\s*diagram\b/i, replacement: "stateDiagram" },
+  { pattern: /^er\s*-?\s*diagram\b/i, replacement: "erDiagram" },
+  { pattern: /^git\s*-?\s*graph\b/i, replacement: "gitGraph" },
+]
+
+function getFirstMeaningfulMermaidLineIndex(lines: string[]): number {
+  return lines.findIndex((line) => {
+    const trimmed = line.trim()
+    return Boolean(trimmed) && !trimmed.startsWith("%%")
+  })
+}
+
+export function isAssistantMermaidCandidateElement(element: HTMLElement): boolean {
+  const code = (
+    element.nodeName.toLowerCase() === "code" ? element : element.querySelector("code")
+  ) as HTMLElement | null
+
+  const labels = [
+    element.getAttribute("data-language"),
+    element.getAttribute("data-test-language"),
+    code?.getAttribute("data-language"),
+    code?.getAttribute("data-test-language"),
+    element.className,
+    code?.className,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+
+  return (
+    labels.includes("language-mermaid") ||
+    labels.includes("lang-mermaid") ||
+    /\bmermaid\b/.test(labels)
+  )
+}
+
+export function looksLikeAssistantMermaidSource(source: string): boolean {
+  const normalized = normalizeAssistantMermaidSource(source)
+  if (!normalized) return false
+
+  const firstMeaningfulLine = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith("%%"))
+
+  if (!firstMeaningfulLine) return false
+
+  return ASSISTANT_MERMAID_SOURCE_PATTERNS.some((pattern) => pattern.test(firstMeaningfulLine))
+}
+
+export function normalizeAssistantMermaidSource(source: string): string {
+  const normalized = source.replace(/\r\n/g, "\n").replace(/\n+$/, "").trim()
+  if (!normalized) return ""
+
+  const lines = normalized.split("\n")
+  const firstMeaningfulLineIndex = getFirstMeaningfulMermaidLineIndex(lines)
+  if (firstMeaningfulLineIndex === -1) {
+    return normalized
+  }
+
+  const originalLine = lines[firstMeaningfulLineIndex]
+  const trimmedLine = originalLine.trim()
+  const leadingWhitespace = originalLine.match(/^\s*/)?.[0] || ""
+
+  for (const { pattern, replacement } of ASSISTANT_MERMAID_SOURCE_NORMALIZERS) {
+    const match = trimmedLine.match(pattern)
+    if (!match) continue
+
+    lines[firstMeaningfulLineIndex] =
+      `${leadingWhitespace}${replacement}${trimmedLine.slice(match[0].length)}`
+    return lines.join("\n")
+  }
+
+  return normalized
+}
+
+export function extractAssistantMermaidSourceFromElement(element: HTMLElement): string | null {
+  const code = (
+    element.nodeName.toLowerCase() === "code" ? element : element.querySelector("code")
+  ) as HTMLElement | null
+  const source = (code?.textContent || element.textContent || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n+$/, "")
+    .trim()
+
+  return source || null
+}
+
+function resolveAssistantMermaidBlockElement(candidate: HTMLElement): HTMLElement | null {
+  const structuredCodeBlock = candidate.closest(
+    "code-block, ms-code-block, ucs-code-block",
+  ) as HTMLElement | null
+  if (structuredCodeBlock) {
+    return structuredCodeBlock
+  }
+
+  const pre = candidate.closest("pre") as HTMLElement | null
+  if (pre) {
+    return pre
+  }
+
+  const codeMirrorBlock = candidate.closest(".cm-editor, #code-block-viewer") as HTMLElement | null
+  if (codeMirrorBlock) {
+    return codeMirrorBlock
+  }
+
+  return candidate
+}
+
+export function findAssistantMermaidBlocks(root: ParentNode): AssistantMermaidBlock[] {
+  const candidates =
+    (DOMToolkit.query(
+      "code-block, ms-code-block, pre, pre code, [data-language], [data-test-language], [data-test-id='code-content'], .cm-content, #code-block-viewer",
+      {
+        parent: root as Node,
+        all: true,
+        shadow: true,
+      },
+    ) as Element[]) || []
+
+  const seen = new Set<HTMLElement>()
+  const blocks: AssistantMermaidBlock[] = []
+
+  for (const candidate of candidates) {
+    if (!(candidate instanceof HTMLElement)) continue
+    if (candidate.closest(".gh-assistant-mermaid")) continue
+
+    const block = resolveAssistantMermaidBlockElement(candidate)
+    if (!block || seen.has(block)) continue
+
+    const source = extractAssistantMermaidSourceFromElement(block)
+    if (!source) continue
+    if (!isAssistantMermaidCandidateElement(block) && !looksLikeAssistantMermaidSource(source)) {
+      continue
+    }
+
+    seen.add(block)
+    blocks.push({ element: block, source })
+  }
+
+  return blocks
+}
+
+// ==================== SiteAdapter 基类 ====================
+
+export abstract class SiteAdapter {
+  protected textarea: HTMLElement | null = null
+  protected _cachedFlutterScrollContainer: HTMLElement | null = null
+  private networkGenerationActive = false
+
+  // ==================== 必须实现的方法 ====================
+
+  /** 检测当前页面是否匹配该站点 */
+  abstract match(): boolean
+
+  /** 返回适配器/站点包标识符（用于能力、行为与更新身份） */
+  abstract getSiteId(): string
+
+  /** 返回当前站点实例的数据分区键；内置站点保持与 siteId 相同。 */
+  getSiteInstanceKey(): string {
+    const origin = typeof window !== "undefined" ? window.location.origin : undefined
+    return createSiteInstanceKey(this.getSiteId(), origin)
+  }
+
+  /** 当前实例是否能安全接管旧版仅按 siteId 保存的数据。 */
+  canClaimLegacySiteData(): boolean {
+    return this.getSiteInstanceKey() === this.getSiteId()
+  }
+
+  /** 返回站点显示名称 */
+  abstract getName(): string
+
+  /** 返回站点主题色 */
+  abstract getThemeColors(): { primary: string; secondary: string }
+
+  /** 返回输入框选择器列表 */
+  abstract getTextareaSelectors(): string[]
+
+  /** 向输入框插入内容 */
+  abstract insertPrompt(content: string): boolean
+
+  /**
+   * 站点特定公式源码提取扩展点。
+   * 未适配站点返回 null，CopyManager 会继续使用通用 DOM/KaTeX 兜底。
+   */
+  extractFormulaCopySource(_target: Element, _formulaHost: Element): FormulaCopySource | null {
+    return null
+  }
+
+  /** 当前站点是否支持从页面 DOM 稳定提取公式源码 */
+  supportsFormulaCopy(): boolean {
+    return true
+  }
+
+  // ==================== 会话相关 ====================
+
+  /** 获取当前会话 ID */
+  getSessionId(): string {
+    const urlWithoutQuery = window.location.href.split("?")[0]
+    const parts = urlWithoutQuery.split("/").filter((p) => p)
+    return parts.length > 0 ? parts[parts.length - 1] : "default"
+  }
+
+  /** 获取新标签页打开的 URL */
+  getNewTabUrl(): string {
+    return window.location.origin
+  }
+
+  /** 是否支持标签页重命名 */
+  supportsTabRename(): boolean {
+    return true
+  }
+
+  /** 获取当前对话标题（用于标签页重命名的兼容回退） */
+  getSessionName(): string | null {
+    return this.getDocumentConversationTitle()
+  }
+
+  protected getDocumentConversationTitle(siteName = this.getName()): string | null {
+    return extractConversationTitleFromDocumentTitle(document.title, {
+      rejectManagedTitle: true,
+      siteName,
+    })
+  }
+
+  /** 获取当前侧边栏选中会话的标题 */
+  abstract getConversationTitle(): string | null
+
+  /** 判断当前是否处于新对话页面 */
+  isNewConversation(): boolean {
+    return false
+  }
+
+  /** 检测是否为分享页面（只读） */
+  isSharePage(): boolean {
+    // 大多数站点的分享链接格式：/share/{id}
+    return window.location.pathname.startsWith("/share/")
+  }
+
+  /**
+   * 判断当前是否为不入库的临时会话页（如 Claude 隐身会话）。
+   * 临时会话不会改变 URL、也不能产生持久会话记录；
+   * 导出时只构建内存态会话元数据，不写入会话库。
+   */
+  isEphemeralConversationPage(): boolean {
+    return false
+  }
+
+  /** 判断当前是否为用户自己的历史会话页 */
+  isUserConversationPage(): boolean {
+    const sessionId = this.getSessionId()?.trim()
+    return (
+      Boolean(sessionId) &&
+      sessionId !== "default" &&
+      !this.isSharePage() &&
+      !this.isNewConversation()
+    )
+  }
+
+  /**
+   * 获取当前团队 ID（用于会话隔离）
+   * 仅在支持多团队的站点（如 Gemini Enterprise）中实现
+   * @returns 团队 ID 或 null（无团队/默认团队）
+   */
+  getCurrentCid(): string | null {
+    return null
+  }
+
+  /** 获取侧边栏会话列表 */
+  getConversationList(): ConversationInfo[] {
+    return []
+  }
+
+  /** 获取已加载的会话数量，用于判断滚动加载是否稳定 */
+  protected getLoadedConversationCount(): number {
+    return this.getConversationList().length
+  }
+
+  /** 获取当前页面会话的基础元数据 */
+  getCurrentConversationInfo(): ConversationInfo | null {
+    const id = this.getSessionId()
+    if (!id || id === "default" || this.isNewConversation()) {
+      return null
+    }
+
+    return {
+      id,
+      title: this.getConversationTitle() || this.getSessionName() || "",
+      url: window.location.href,
+      cid: this.getCurrentCid() || undefined,
+    }
+  }
+
+  /** 获取侧边栏滚动容器 */
+  getSidebarScrollContainer(): Element | null {
+    return null
+  }
+
+  /** 获取会话观察器配置 */
+  getConversationObserverConfig(): ConversationObserverConfig | null {
+    return null
+  }
+
+  /**
+   * 导航到指定会话（SPA 导航，不刷新页面）
+   * 各站点适配器应覆盖此方法实现站点特定的导航逻辑
+   * @param _id 会话 ID
+   * @param url 会话 URL（用于降级硬刷新）
+   * @returns 是否成功导航
+   */
+  navigateToConversation(_id: string, url?: string): boolean {
+    // 默认实现：直接跳转（刷新页面）
+    if (url) {
+      window.location.href = url
+      return true
+    }
+    return false
+  }
+
+  /** 滚动加载全部会话 */
+  async deleteConversationOnSite(
+    target: ConversationDeleteTarget,
+  ): Promise<SiteDeleteConversationResult> {
+    return {
+      id: target.id,
+      success: false,
+      method: "none",
+      reason: "not_supported",
+    }
+  }
+
+  async deleteConversationsOnSite(
+    targets: ConversationDeleteTarget[],
+  ): Promise<SiteDeleteConversationResult[]> {
+    const results: SiteDeleteConversationResult[] = []
+    for (const target of targets) {
+      results.push(await this.deleteConversationOnSite(target))
+    }
+    return results
+  }
+
+  async loadAllConversations(): Promise<boolean | void> {
+    const container = this.getSidebarScrollContainer()
+    if (!container) return false
+
+    let lastCount = this.getLoadedConversationCount()
+    let lastScrollHeight = container.scrollHeight
+    let stableRounds = 0
+    const maxStableRounds = 4
+    const maxRounds = 40
+    const waitMs = 800
+
+    for (let round = 0; round < maxRounds; round++) {
+      container.scrollTop = container.scrollHeight
+      container.dispatchEvent(new Event("scroll", { bubbles: true }))
+      await new Promise((r) => setTimeout(r, waitMs))
+
+      const currentCount = this.getLoadedConversationCount()
+      const currentScrollHeight = container.scrollHeight
+      const hasProgress = currentCount > lastCount || currentScrollHeight > lastScrollHeight
+
+      if (hasProgress) {
+        lastCount = Math.max(lastCount, currentCount)
+        lastScrollHeight = Math.max(lastScrollHeight, currentScrollHeight)
+        stableRounds = 0
+      } else {
+        stableRounds++
+      }
+
+      if (stableRounds >= maxStableRounds) {
+        return true
+      }
+    }
+
+    return false
+  }
+
+  // ==================== 生成状态检测 ====================
+
+  /** 由网络监控状态机同步当前已确认的生成状态。 */
+  setNetworkGenerationState(active: boolean): void {
+    this.networkGenerationActive = active
+  }
+
+  /** 检测 AI 是否正在生成响应 */
+  isGenerating(): boolean {
+    return this.networkGenerationActive
+  }
+
+  /**
+   * 某些站点刷新时会命中与真实生成相同的流式请求。
+   * 返回 true 时，只有在 DOM 生成态出现后，才把该轮网络请求视为真实生成。
+   */
+  requiresDomConfirmationForNetworkGeneration(): boolean {
+    return false
+  }
+
+  /** 获取当前使用的模型名称 */
+  getModelName(): string | null {
+    return null
+  }
+
+  /**
+   * 获取模型锁定时用于判定“当前模型”的文本。
+   * 默认保持旧行为：直接读取选择器按钮文本。
+   * 站点可覆盖此方法，使用更可靠的模型来源。
+   */
+  getModelLockCheckText(selectorBtn?: HTMLElement | null): string {
+    return selectorBtn?.textContent || selectorBtn?.innerText || ""
+  }
+
+  /** 获取网络监控配置 */
+  getNetworkMonitorConfig(): NetworkMonitorConfig | null {
+    return null
+  }
+
+  /**
+   * 当前站点是否支持由 Ophel 联动宿主页主题。
+   * 不支持的站点仍可独立切换 Ophel 面板主题。
+   */
+  supportsHostThemeSync(): boolean {
+    return true
+  }
+
+  /**
+   * 切换站点主题（子类可覆盖以实现站点特定的主题切换逻辑）
+   * @param targetMode 目标主题模式
+   * @returns 是否成功切换
+   */
+  async toggleTheme(_targetMode: "light" | "dark"): Promise<boolean> {
+    // 基类默认不处理，交给 ThemeManager 直接操作 DOM
+    return false
+  }
+
+  /**
+   * 是否由子类提供了站点专用主题切换逻辑。
+   * 用于避免在自定义切换后再次套用通用 fallback，造成宿主页面状态冲突。
+   */
+  hasCustomToggleTheme(): boolean {
+    return this.toggleTheme !== SiteAdapter.prototype.toggleTheme
+  }
+
+  /**
+   * 检测宿主页当前主题模式（light/dark）。
+   * 返回 null 表示本适配器无法检测，ThemeManager 回退到通用 DOM 检测。
+   */
+  detectHostThemeMode(): "light" | "dark" | null {
+    return null
+  }
+
+  /**
+   * 检测宿主页当前主题偏好（含 system）。
+   * 返回 null 表示本适配器无法检测，ThemeManager 回退到站点特定/通用检测。
+   */
+  detectHostThemePreference(): "light" | "dark" | "system" | null {
+    return null
+  }
+
+  /**
+   * toggleTheme 是否接受 "system" 语义（由适配器自行解析/清除跟随系统状态）。
+   * 基类与仅接受 light/dark 的适配器保持 false。
+   */
+  acceptsSystemThemePreference(): boolean {
+    return false
+  }
+
+  /**
+   * 返回站点原生主题覆盖 CSS。
+   * 默认不提供，子类可按需覆盖。
+   */
+  getNativeThemeCss(): string | null {
+    return null
+  }
+
+  // ==================== Capability opt-in ====================
+
+  /** 返回站点声明式能力；默认空对象，未迁移站点继续使用旧方法。 */
+  getCapabilities(): AdapterCapabilities {
+    return {}
+  }
+
+  /** 返回功能入口能力；与 LayoutManager 使用的 getCapabilities() 保持独立。 */
+  getFeatureCapabilities(): Set<SitePackCapability> {
+    return getBuiltinFeatureCapabilities(this.getSiteId())
+  }
+
+  hasFeatureCapability(capability: SitePackCapability): boolean {
+    return this.getFeatureCapabilities().has(capability)
+  }
+
+  // ==================== 页面宽度控制 ====================
+
+  /** 返回需要加宽的 CSS 选择器列表 */
+  getWidthSelectors(): WidthSelectorConfig[] {
+    return []
+  }
+
+  /** 返回用户问题宽度调整的 CSS 选择器列表 */
+  getUserQueryWidthSelectors(): WidthSelectorConfig[] {
+    return []
+  }
+
+  /** 返回 Ophel 面板安全区避让配置；默认关闭，由站点逐步 opt-in。 */
+  getPanelAvoidanceConfig(): PanelAvoidanceConfig | null {
+    return null
+  }
+
+  /** 返回 Zen Mode 配置（隐藏侧边栏/导航栏，专注当前对话） */
+  getZenModeConfig(): ZenModeConfig | null {
+    return null
+  }
+
+  /** 返回净化模式配置（隐藏免责声明、广告、下载按钮等冗余元素） */
+  getCleanModeConfig(): ZenModeConfig | null {
+    return null
+  }
+
+  /** 获取 Markdown 修复器配置（子类可覆盖） */
+  getMarkdownFixerConfig(): MarkdownFixerConfig | null {
+    return null
+  }
+
+  /** 获取 AI 回复 Mermaid 渲染支持模式 */
+  getAssistantMermaidSupportMode(): AssistantMermaidSupportMode {
+    return "native"
+  }
+
+  /**
+   * 查找 AI 回复中的 Mermaid 代码块。
+   * 子类可覆盖以适配非标准代码块结构。
+   */
+  getAssistantMermaidBlocks(root: ParentNode): AssistantMermaidBlock[] {
+    return findAssistantMermaidBlocks(root)
+  }
+
+  // ==================== 输入框操作 ====================
+
+  /** 获取提交按钮选择器 */
+  getSubmitButtonSelectors(): string[] {
+    return []
+  }
+
+  /**
+   * 精准查找提交按钮
+   * 当站点存在多个相邻 icon button，且仅靠通用选择器/距离判断容易误判时使用
+   */
+  findSubmitButton(_editor: HTMLElement | null): HTMLElement | null {
+    return null
+  }
+
+  /**
+   * 获取发送消息的快捷键配置
+   * 子类可覆盖以适配不同平台的发送键设置
+   * @returns 发送键配置：key 为 "Enter" 或 "Ctrl+Enter"
+   */
+  getSubmitKeyConfig(): { key: "Enter" | "Ctrl+Enter" } {
+    // 默认使用 Enter 键发送
+    return { key: "Enter" }
+  }
+
+  /** 查找输入框元素 */
+  findTextarea(): HTMLElement | null {
+    for (const selector of this.getTextareaSelectors()) {
+      const elements = document.querySelectorAll(selector)
+      for (const element of Array.from(elements)) {
+        if (this.isValidTextarea(element as HTMLElement)) {
+          this.textarea = element as HTMLElement
+          return element as HTMLElement
+        }
+      }
+    }
+    return null
+  }
+
+  /** 验证输入框是否有效 */
+  isValidTextarea(element: HTMLElement): boolean {
+    // 排除扩展自身的 UI 元素（队列 overlay、面板等）
+    if (element.closest(".gh-main-panel") || element.closest(".gh-queue-panel")) return false
+    if (
+      Array.from(element.classList).some(
+        (cls) => cls.startsWith("gh-queue-") || cls.startsWith("gh-"),
+      )
+    )
+      return false
+    return element.offsetParent !== null
+  }
+
+  /** 清空输入框内容 */
+  clearTextarea(): void {
+    if (this.textarea) {
+      if (
+        this.textarea instanceof HTMLInputElement ||
+        this.textarea instanceof HTMLTextAreaElement
+      ) {
+        this.textarea.value = ""
+      } else {
+        this.textarea.textContent = ""
+      }
+      this.textarea.dispatchEvent(new Event("input", { bubbles: true }))
+    }
+  }
+
+  /** 获取输入框元素（用于外部获取输入框位置） */
+  getTextareaElement(): HTMLElement | null {
+    // 如果已缓存的输入框仍然有效，直接返回
+    if (this.textarea && this.textarea.isConnected) {
+      return this.textarea
+    }
+    // 否则重新查找
+    return this.findTextarea()
+  }
+
+  // ==================== 滚动控制 ====================
+
+  /** 获取滚动容器 */
+  getScrollContainer(): HTMLElement | null {
+    const selectors = [
+      "infinite-scroller.chat-history",
+      ".chat-mode-scroller",
+      "main",
+      '[role="main"]',
+      ".conversation-container",
+      ".chat-container",
+      "div.content-container",
+    ]
+
+    for (const selector of selectors) {
+      const container = document.querySelector(selector) as HTMLElement
+      if (container && container.scrollHeight > container.clientHeight) {
+        this._cachedFlutterScrollContainer = null
+        return container
+      }
+    }
+
+    // 检查缓存的 Flutter 容器是否仍然有效
+    if (this._cachedFlutterScrollContainer && this._cachedFlutterScrollContainer.isConnected) {
+      return this._cachedFlutterScrollContainer
+    }
+
+    // 尝试在 iframe 中查找（Gemini 图文并茂模式专用）
+    // 只在 Gemini 普通版站点遍历 iframe，其他站点跳过以避免跨域警告
+    if (this.getSiteId() === SITE_IDS.GEMINI) {
+      const iframes = document.querySelectorAll('iframe[sandbox*="allow-same-origin"]')
+      for (const iframe of Array.from(iframes)) {
+        try {
+          const iframeDoc =
+            (iframe as HTMLIFrameElement).contentDocument ||
+            (iframe as HTMLIFrameElement).contentWindow?.document
+          if (iframeDoc) {
+            const scrollContainer = iframeDoc.querySelector(
+              'flt-semantics[style*="overflow-y: scroll"]:not([style*="overflow-x: scroll"])',
+            ) as HTMLElement
+            if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
+              this._cachedFlutterScrollContainer = scrollContainer
+              return scrollContainer
+            }
+          }
+        } catch (e) {
+          console.warn("[Ophel] Failed to access iframe:", (e as Error).message)
+        }
+      }
+    }
+
+    return null
+  }
+
+  /** 获取当前视口中可见的锚点元素信息 */
+  getVisibleAnchorElement(): AnchorData | null {
+    const container = this.getScrollContainer()
+    if (!container) return null
+
+    const scrollTop = container.scrollTop
+    const selectors = this.getChatContentSelectors()
+    if (!selectors.length) return null
+
+    const candidates = Array.from(container.querySelectorAll(selectors.join(", ")))
+    if (!candidates.length) return null
+
+    let bestElement: Element | null = null
+
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i] as HTMLElement
+      const top = el.offsetTop
+
+      if (top <= scrollTop + 100) {
+        bestElement = el
+      } else {
+        break
+      }
+    }
+
+    if (!bestElement && candidates.length > 0) bestElement = candidates[0]
+
+    if (bestElement) {
+      const offset = scrollTop - (bestElement as HTMLElement).offsetTop
+      const id = bestElement.getAttribute("data-message-id") || bestElement.id
+
+      if (id) {
+        let selector = `[data-message-id="${id}"]`
+        if (!bestElement.matches(selector)) selector = `#${id}`
+        return { type: "selector", selector, offset }
+      } else {
+        const globalIndex = candidates.indexOf(bestElement)
+        if (globalIndex !== -1) {
+          const textSignature = (bestElement.textContent || "").trim().substring(0, 50)
+          return { type: "index", index: globalIndex, offset, textSignature }
+        }
+      }
+    }
+    return null
+  }
+
+  /** 根据保存的锚点信息恢复滚动 */
+  restoreScroll(anchorData: AnchorData): boolean {
+    const container = this.getScrollContainer()
+    if (!container || !anchorData) return false
+
+    let targetElement: Element | null = null
+
+    if (anchorData.type === "selector" && anchorData.selector) {
+      targetElement = container.querySelector(anchorData.selector)
+    } else if (anchorData.type === "index" && typeof anchorData.index === "number") {
+      const selectors = this.getChatContentSelectors()
+      const candidates = Array.from(container.querySelectorAll(selectors.join(", ")))
+
+      if (candidates[anchorData.index]) {
+        targetElement = candidates[anchorData.index]
+
+        if (anchorData.textSignature) {
+          const currentText = (targetElement.textContent || "").trim().substring(0, 50)
+          if (currentText !== anchorData.textSignature) {
+            const found = candidates.find(
+              (c) => (c.textContent || "").trim().substring(0, 50) === anchorData.textSignature,
+            )
+            if (found) targetElement = found
+          }
+        }
+      } else if (anchorData.textSignature) {
+        const found = candidates.find(
+          (c) => (c.textContent || "").trim().substring(0, 50) === anchorData.textSignature,
+        )
+        if (found) targetElement = found
+      }
+    }
+
+    if (targetElement) {
+      const targetTop = (targetElement as HTMLElement).offsetTop + (anchorData.offset || 0)
+      container.scrollTo({
+        top: targetTop,
+        behavior: "instant" as ScrollBehavior,
+      })
+      return true
+    }
+    return false
+  }
+
+  // ==================== 大纲提取 ====================
+
+  /** 获取对话历史容器的选择器 */
+  getResponseContainerSelector(): string {
+    return ""
+  }
+
+  /**
+   * 返回 MutationObserver 应观察的目标元素。
+   * 默认使用 getResponseContainerSelector() 找到的容器，找不到时返回 null（fallback 到 document.body）。
+   * 各适配器可覆盖以返回更精确的容器，从而减少 AI 生成时的无效回调。
+   */
+  getObserveTarget(): Element | null {
+    const selector = this.getResponseContainerSelector()
+    if (!selector) return null
+    return document.querySelector(selector)
+  }
+
+  /** 获取聊天内容元素的选择器列表 */
+  getChatContentSelectors(): string[] {
+    return []
+  }
+
+  /** 获取用户提问元素的选择器 */
+  getUserQuerySelector(): string | null {
+    return null
+  }
+
+  /**
+   * 返回当前站点的 Quick Quote 支持模式。
+   * - enabled: Ophel 完全接管（选区浮层 + 引用 chip 都显示）
+   * - native: 站点有原生引用功能，Ophel 智能避让（悬浮框自动调整位置，避免遮挡原生功能）
+   *   - 用户可以选择使用原生引用或 Ophel 的 chain
+   *   - 使用 Ophel chain 时会渲染 quote chip 锚点
+   *   - 使用原生引用时不会有 Ophel 锚点
+   * - disabled: 站点不支持或不兼容 Quick Quote 功能
+   *
+   * 典型的 disabled 使用场景：
+   * - 页面原生不支持引用，也不支持持久化 Ophel 的锚点（如 AI Studio）
+   * - 页面原生支持引用，但插入 Ophel 的锚点后页面会崩溃（如 Qianwen）
+   */
+  getQuickQuoteSupportMode(): QuickQuoteSupportMode {
+    return "enabled"
+  }
+
+  /**
+   * 返回当前站点原生引用悬浮框的选择器列表。
+   * 用于智能避让：当检测到原生悬浮框时，Ophel 会调整自己的位置避免遮挡。
+   * 仅在 getQuickQuoteSupportMode() 返回 "native" 时生效。
+   *
+   * @returns 原生引用悬浮框的 CSS 选择器数组，如果不需要避让则返回空数组
+   */
+  getNativeQuotePopoverSelectors(): string[] {
+    return []
+  }
+
+  /**
+   * 返回 Quick Quote chip 应挂载到的用户消息内容容器。
+   * 默认优先使用我们统一注入的用户提问 Markdown 容器；站点特殊布局由具体 adapter 覆盖。
+   */
+  getQuickQuoteChipHost(element: Element): HTMLElement | null {
+    const containers = Array.from(element.querySelectorAll<HTMLElement>(".gh-user-query-markdown"))
+    return (
+      containers.find((container) => {
+        const style = window.getComputedStyle(container)
+        return style.display !== "none" && style.visibility !== "hidden"
+      }) || null
+    )
+  }
+
+  /**
+   * 提取文本，保留块级元素和 <br> 的换行
+   * 用于复制用户提问时保留原始格式
+   */
+  protected extractTextWithLineBreaks(element: Element): string {
+    const result: string[] = []
+    const blockTags = new Set([
+      "div",
+      "p",
+      "li",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "pre",
+      "blockquote",
+      "tr",
+      "section",
+      "article",
+    ])
+
+    const walk = (node: Node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // 文本节点：直接追加
+        const text = node.textContent || ""
+        result.push(text)
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element
+        const tag = el.tagName.toLowerCase()
+
+        // <br> 直接换行
+        if (tag === "br") {
+          result.push("\n")
+          return
+        }
+
+        // 遍历子节点
+        for (const child of el.childNodes) {
+          walk(child)
+        }
+
+        // 块级元素结束后加换行（避免连续换行）
+        if (blockTags.has(tag) && result.length > 0) {
+          const lastChar = result[result.length - 1]
+          if (!lastChar.endsWith("\n")) {
+            result.push("\n")
+          }
+        }
+      }
+    }
+
+    walk(element)
+
+    // 清理：合并连续换行（最多两个），去掉首尾空白
+    return result
+      .join("")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  }
+
+  /**
+   * 使用 Range API 计算两个 DOM 节点之间的文本长度
+   * 通用于 Heading 类型的 OutlineItem 字数统计
+   * @param startEl 起始元素（不包含其内容，从其之后开始）
+   * @param endEl 结束元素（不包含，在其之前结束）；若为 null 则使用 fallbackContainer
+   * @param fallbackContainer 当 endEl 为 null 时使用的容器末尾
+   * @returns 文本字符数
+   */
+  protected calculateRangeWordCount(
+    startEl: Element,
+    endEl: Element | null,
+    fallbackContainer?: Element | null,
+  ): number {
+    if (!startEl) return 0
+    try {
+      const range = document.createRange()
+      range.setStartAfter(startEl)
+      if (endEl) {
+        range.setEndBefore(endEl)
+      } else if (fallbackContainer?.lastChild) {
+        range.setEndAfter(fallbackContainer.lastChild)
+      } else {
+        return 0
+      }
+      return range.toString().trim().length
+    } catch {
+      return 0
+    }
+  }
+
+  /** 从用户提问元素中提取文本（保留换行） */
+  extractUserQueryText(element: Element): string {
+    return this.extractTextWithLineBreaks(element)
+  }
+
+  /**
+   * 从用户提问元素中提取原始 Markdown 文本
+   * 子类可重写以处理特殊的 DOM 结构（如按行拆分、Shadow DOM 等）
+   * 默认实现：调用 extractUserQueryText
+   */
+  extractUserQueryMarkdown(element: Element): string {
+    return this.extractUserQueryText(element)
+  }
+
+  /**
+   * 导出时提取用户提问内容
+   * 默认沿用纯文本提取，子类可覆盖以返回适合导出的文本内容
+   * （例如 Markdown、图片链接等）。
+   */
+  extractUserQueryExportContent(element: Element): string {
+    return this.extractUserQueryText(element)
+  }
+
+  /**
+   * 将渲染后的 HTML 替换到用户提问元素中
+   * 子类可重写以处理特殊的 DOM 结构
+   * @returns 是否成功替换
+   */
+  replaceUserQueryContent(_element: Element, _html: string): boolean {
+    // 默认实现：不支持替换
+    return false
+  }
+
+  /**
+   * 从AI回复元素中提取文本（保留换行）
+   * 默认实现：直接提取文本,子类可重写以处理特殊结构(如Claude Artifacts)
+   */
+  extractAssistantResponseText(element: Element): string {
+    return this.extractTextWithLineBreaks(element)
+  }
+
+  /**
+   * 检查元素是否在渲染的 Markdown 容器内
+   * 用于大纲抽取时排除用户提问渲染容器中的标题
+   */
+  isInRenderedMarkdownContainer(element: Element): boolean {
+    return element.closest(".gh-user-query-markdown") !== null
+  }
+
+  /**
+   * 是否使用 Shadow DOM 渲染用户提问
+   * 用于决定是否需要延迟处理（等待 Shadow DOM 渲染）
+   */
+  usesShadowDOM(): boolean {
+    return false
+  }
+
+  /** 从页面提取大纲 */
+  extractOutline(
+    _maxLevel = 6,
+    _includeUserQueries = false,
+    _showWordCount = false,
+  ): OutlineItem[] {
+    return []
+  }
+
+  getOutlineSources(): OutlineSource[] {
+    return [{ id: "conversation", kind: "conversation", label: "对话", available: true }]
+  }
+
+  supportsDynamicOutlineSources(): boolean {
+    return false
+  }
+
+  /**
+   * Some virtualized/lazy-mounted conversation views do not reliably emit DOM
+   * mutations when distant messages mount. Opt in only for sites that need a
+   * periodic outline refresh fallback while the outline is active.
+   */
+  usesPeriodicOutlineRefreshFallback(): boolean {
+    return false
+  }
+
+  getOutlineSourcesSignature(): string {
+    return this.getOutlineSources()
+      .map((source) => `${source.id}:${source.kind}:${source.available}:${source.count ?? ""}`)
+      .join("|")
+  }
+
+  extractOutlineForSource(
+    sourceId: string,
+    maxLevel = 6,
+    includeUserQueries = false,
+    showWordCount = false,
+  ): OutlineItem[] {
+    if (sourceId !== "conversation") return []
+    return this.extractOutline(maxLevel, includeUserQueries, showWordCount)
+  }
+
+  /**
+   * 返回只用于页内收藏图标的当前 DOM 候选项。
+   * 页内收藏运行时不依赖大纲 Tab 是否激活，因此这里直接复用站点自身的大纲抽取逻辑，
+   * 为 inline observer 提供新生成的标题和用户提问候选。
+   */
+  getInlineBookmarkItems(): OutlineItem[] {
+    return this.extractOutline(6, true, false).filter((item) => item.element?.isConnected)
+  }
+
+  /**
+   * 根据标题级别和文本查找元素（支持 Shadow DOM 穿透）
+   * 用于大纲跳转时元素失效后的重新查找
+   * @param level 标题级别 (1-6)
+   * @param text 标题文本内容
+   * @returns 匹配的元素，未找到返回 null
+   */
+  findElementByHeading(level: number, text: string): Element | null {
+    // 默认实现：使用 document.querySelectorAll（子类可覆盖以支持 Shadow DOM）
+    const headings = document.querySelectorAll(`h${level}`)
+    for (const h of Array.from(headings)) {
+      if (h.textContent?.trim() === text) {
+        return h
+      }
+    }
+    return null
+  }
+
+  /**
+   * 根据 queryIndex 和文本查找用户提问元素
+   * 用于大纲跳转时元素失效后的重新查找
+   * @param queryIndex 用户提问的序号（从 1 开始）
+   * @param text 用户提问文本（用于验证和回退搜索）
+   * @returns 匹配的元素，未找到返回 null
+   */
+  findActiveOutlineItemId(): string | null {
+    return null
+  }
+
+  findUserQueryElement(queryIndex: number, text: string): Element | null {
+    const selector = this.getUserQuerySelector()
+    if (!selector) return null
+
+    const elements = DOMToolkit.query(selector, { all: true, shadow: true }) as Element[]
+    if (!elements || elements.length === 0) return null
+
+    // 1. 尝试按索引查找并验证文本
+    if (elements.length >= queryIndex) {
+      const candidate = elements[queryIndex - 1]
+      const candidateText = this.extractUserQueryText(candidate)
+      // 验证：文本匹配或包含关系（大纲可能显示截断的文本）
+      if (
+        candidateText === text ||
+        candidateText.startsWith(text) ||
+        text.startsWith(candidateText)
+      ) {
+        return candidate
+      }
+    }
+
+    // 2. 回退：按文本内容搜索所有用户提问
+    for (const el of elements) {
+      const elText = this.extractUserQueryText(el)
+      if (elText === text || elText.startsWith(text) || text.startsWith(elText)) {
+        return el
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * 解析大纲项对应的页面元素。
+   * 默认仅做同步 DOM 查找，子类可覆盖以支持虚拟列表/原生导航等异步定位。
+   */
+  async resolveOutlineTarget(
+    item: Pick<OutlineItem, "level" | "text" | "isUserQuery" | "id" | "navigationId">,
+    queryIndex?: number,
+    _sourceId = "conversation",
+  ): Promise<Element | null> {
+    if (item.isUserQuery && item.level === 0 && queryIndex !== undefined) {
+      return this.findUserQueryElement(queryIndex, item.text)
+    }
+
+    return this.findElementByHeading(item.level, item.text)
+  }
+
+  /**
+   * 将大纲目标元素滚动到可见区域。
+   * 默认使用 scrollIntoView；子类可覆盖以避免外层容器被意外滚动（如 Shadow DOM 场景）。
+   */
+  scrollToOutlineTarget(element: HTMLElement): void {
+    element.scrollIntoView({
+      behavior: "instant",
+      block: "start",
+      __bypassLock: true,
+    } as any)
+  }
+
+  getOutlineScrollContainer(_sourceId = "conversation"): HTMLElement | null {
+    return this.getScrollContainer()
+  }
+
+  scrollToOutlineSourceTarget(element: HTMLElement, sourceId = "conversation"): void {
+    void sourceId
+    this.scrollToOutlineTarget(element)
+  }
+
+  /** 获取导出配置 */
+  getExportConfig(): ExportConfig | null {
+    return null
+  }
+
+  /**
+   * 站点自定义导出消息抽取。
+   *
+   * 适用于普通 turn/user/assistant selector 无法表达的页面形态，
+   * 例如分享文档、Canvas、Artifact、虚拟列表快照等。
+   * 返回 null 表示继续使用通用 selector 导出逻辑。
+   */
+  async extractExportMessages(_context: ExportLifecycleContext): Promise<ExportMessage[] | null> {
+    return null
+  }
+
+  /**
+   * Whether the site renders messages in reverse DOM order (e.g.
+   * flex-col-reverse). When true, the export pipeline reverses turn
+   * order so exported messages follow visual (oldest-first) order.
+   */
+  isExportReversed(): boolean {
+    return false
+  }
+
+  /**
+   * 站点自定义导出包抽取。
+   *
+   * 用于导出消息之外的附件资产（图片、文档、Artifact 等）。
+   * 返回 null 表示站点尚未接入附件导出，核心逻辑会继续使用旧的文本导出路径。
+   */
+  async extractExportBundle(_context: ExportLifecycleContext): Promise<ExportBundle | null> {
+    return null
+  }
+
+  protected async createExportBundleFromMessages(
+    extractMessages: (
+      collector: ExportAssetCollector,
+    ) => ExportMessage[] | Promise<ExportMessage[]>,
+  ): Promise<ExportBundle | null> {
+    const collector = createExportAssetCollector()
+    const messages = await extractMessages(collector)
+    if (messages.length === 0) return null
+
+    return {
+      messages,
+      assets: collector.assets,
+    }
+  }
+
+  /**
+   * 导出前生命周期钩子。
+   * 可用于准备导出内容（例如展开懒加载内容、记录页面状态等）。
+   * 默认不做处理，返回 null。
+   */
+  async prepareConversationExport(_context: ExportLifecycleContext): Promise<unknown> {
+    return null
+  }
+
+  /**
+   * 导出后生命周期钩子。
+   * 可用于恢复导出前状态（例如恢复折叠状态、滚动位置等）。
+   * 默认不做处理。
+   */
+  async restoreConversationAfterExport(
+    _context: ExportLifecycleContext,
+    _state: unknown,
+  ): Promise<void> {}
+
+  /**
+   * 导出采集完整性报告（虚拟滚动站点可选实现）。
+   *
+   * 适配器在 prepareConversationExport 采集后缓存报告，manager 在提取完成后读取。
+   * 默认返回 null，表示该站点不提供完整性判定。
+   */
+  getExportCollectionReport(): ExportCollectionReport | null {
+    return null
+  }
+
+  /**
+   * 历史起点是否未加载完（适配器可选实现）。
+   *
+   * manager 的 loading-history 高度收敛后调用：返回 true 说明最早锚点尚未进入 DOM
+   * （如 ChatGPT 起始 conversation-turn-N > 1，慢网络下分页请求在飞时高度可能暂时不变），
+   * manager 会继续滚顶做有界补载。默认 false——无法判定的站点行为与现状一致。
+   */
+  hasUnloadedConversationHistory(): boolean {
+    return false
+  }
+
+  // ==================== 新对话监听 ====================
+
+  /** 获取最新回复的文本内容（用于复制功能） */
+  getLatestReplyText(): string | null {
+    return null
+  }
+
+  /** 获取最后一个代码块的文本内容（用于复制功能） */
+  getLastCodeBlockText(): string | null {
+    const latestReplyText = this.getLatestReplyText()
+    const latestReplyCode = this.extractLastFencedCodeBlockText(latestReplyText || "")
+    if (latestReplyCode) {
+      return latestReplyCode
+    }
+
+    const responses = this.getAssistantResponseElementsForCodeSearch()
+    for (let i = responses.length - 1; i >= 0; i -= 1) {
+      const response = responses[i]
+
+      const codeFromDom = this.extractLastCodeBlockTextFromDomRoot(response)
+      if (codeFromDom) {
+        return codeFromDom
+      }
+
+      const responseText = this.extractAssistantResponseText(response).trim()
+      const codeFromMarkdown = this.extractLastFencedCodeBlockText(responseText)
+      if (codeFromMarkdown) {
+        return codeFromMarkdown
+      }
+    }
+
+    if (responses.length === 0) {
+      return this.extractLastCodeBlockTextFromDomRoot(this.getPrimaryCodeSearchRoot())
+    }
+
+    return null
+  }
+
+  /** 获取"新对话"按钮的选择器列表 */
+  getNewChatButtonSelectors(): string[] {
+    return []
+  }
+
+  /** 触发站点原生"新对话"入口 */
+  startNewConversation(): boolean {
+    const beforeState = this.captureConversationNavigationState()
+    const trigger = this.findVisibleElementBySelectors(this.getNewChatButtonSelectors())
+    if (trigger) {
+      this.simulateClick(trigger)
+
+      window.setTimeout(() => {
+        if (!this.hasConversationNavigationChanged(beforeState)) {
+          this.navigateToNewConversationUrl()
+        }
+      }, 150)
+
+      return true
+    }
+
+    return this.navigateToNewConversationUrl()
+  }
+
+  /** 获取"停止生成"按钮的选择器列表 */
+  getStopButtonSelectors(): string[] {
+    return []
+  }
+
+  /** 触发站点原生"停止生成"入口 */
+  stopGeneration(): boolean {
+    const trigger = this.findVisibleElementBySelectors(this.getStopButtonSelectors())
+    if (!trigger) {
+      return false
+    }
+
+    this.simulateClick(trigger)
+    return true
+  }
+
+  // ==================== 模型锁定 ====================
+
+  /** 获取默认的模型锁定设置 */
+  getDefaultLockSettings(): { enabled: boolean; keyword: string } {
+    return { enabled: false, keyword: "" }
+  }
+
+  /** 获取模型锁定配置 */
+  getModelSwitcherConfig(_keyword: string): ModelSwitcherConfig | null {
+    return null
+  }
+
+  /**
+   * 模拟点击元素（子类可覆盖以适配特殊的点击事件处理）
+   * 默认使用 HTMLElement.click()，某些站点（如 ChatGPT）需要完整的 PointerEvent 序列
+   */
+  protected simulateClick(element: HTMLElement): void {
+    element.click()
+  }
+
+  /**
+   * 点击模型选择器按钮（公开方法，供外部调用）
+   * 使用 simulateClick 确保在 Radix UI 等框架中也能正常工作
+   * 使用 findElementBySelectors 支持 Shadow DOM 穿透（与 lockModel 一致）
+   * @returns 是否成功点击
+   */
+  clickModelSelector(): boolean {
+    const config = this.getModelSwitcherConfig("")
+    if (!config || !config.selectorButtonSelectors) {
+      return false
+    }
+
+    // 使用 findElementBySelectors 穿透 Shadow DOM 查找按钮
+    const btn = this.findElementBySelectors(config.selectorButtonSelectors)
+    if (btn && btn.offsetParent !== null) {
+      this.simulateClick(btn)
+      return true
+    }
+    return false
+  }
+
+  /**
+   * 通用模型锁定实现（分阶段执行，优化用户体验）
+   *
+   * 阶段1: 等待按钮出现（最多 10 秒）
+   * 阶段2: 检查当前模型是否已是目标
+   * 阶段3: 打开菜单搜索（仅一次，失败立即停止）
+   * 阶段4: 验证切换成功（最多 3 次）
+   */
+  lockModel(keyword: string, onSuccess?: () => void): void {
+    const config = this.getModelSwitcherConfig(keyword)
+    if (!config) return
+
+    const {
+      targetModelKeyword,
+      selectorButtonSelectors,
+      menuItemSelector,
+      checkInterval = 1000,
+      maxAttempts = 10,
+      menuRenderDelay = 500,
+      subMenuTriggers = [],
+      subMenuSelector,
+    } = config
+
+    const normalize = (str: string) => (str || "").toLowerCase().trim()
+    const target = normalize(targetModelKeyword)
+
+    let buttonWaitAttempts = 0
+    const maxButtonWait = maxAttempts // 等待按钮最多 10 次
+
+    // 阶段1: 等待按钮出现
+    const waitForButton = setInterval(() => {
+      buttonWaitAttempts++
+
+      const selectorBtn = this.findElementBySelectors(selectorButtonSelectors)
+
+      if (selectorBtn) {
+        clearInterval(waitForButton)
+
+        // 阶段2: 检查当前模型
+        const currentText = normalize(this.getModelLockCheckText(selectorBtn))
+        if (currentText.includes(target)) {
+          // 已经是目标模型，直接成功
+          if (onSuccess) onSuccess()
+          return
+        }
+
+        // 阶段3: 打开菜单搜索
+        this.performMenuSearch(
+          selectorBtn,
+          target,
+          menuItemSelector,
+          menuRenderDelay,
+          subMenuTriggers,
+          subMenuSelector,
+          onSuccess,
+          maxAttempts,
+        )
+      } else if (buttonWaitAttempts >= maxButtonWait) {
+        clearInterval(waitForButton)
+        console.warn(`Ophel: Model selector button not found after ${maxButtonWait} attempts.`)
+        this.showModelLockFailure(targetModelKeyword, "button_not_found")
+      }
+    }, checkInterval)
+  }
+
+  /**
+   * 执行菜单搜索（仅执行一次，不重复打开关闭）
+   */
+  private performMenuSearch(
+    selectorBtn: HTMLElement,
+    target: string,
+    menuItemSelector: string,
+    menuRenderDelay: number,
+    subMenuTriggers: string[],
+    subMenuSelector: string | undefined,
+    onSuccess?: () => void,
+    maxMenuAttempts = 10,
+  ): void {
+    // Open menu
+    this.simulateClick(selectorBtn)
+
+    const maxWaitAttempts = Math.max(3, maxMenuAttempts)
+    let menuAttempts = 0
+
+    const tryFindMenuItems = () => {
+      menuAttempts++
+      const menuItems = this.getVisibleMenuItems(menuItemSelector, selectorBtn)
+
+      if (menuItems.length > 0) {
+        this.searchAndSelectModel(
+          menuItems,
+          target,
+          menuItemSelector,
+          menuRenderDelay,
+          subMenuTriggers,
+          subMenuSelector,
+          onSuccess,
+        )
+        return
+      }
+
+      if (menuAttempts >= maxWaitAttempts) {
+        document.body.click()
+        console.warn(`Ophel: Menu items not found.`)
+        this.showModelLockFailure(target, "menu_empty")
+        return
+      }
+
+      setTimeout(tryFindMenuItems, menuRenderDelay)
+    }
+
+    setTimeout(tryFindMenuItems, menuRenderDelay)
+  }
+
+  /**
+   * 在菜单项中搜索并选择目标模型
+   */
+  private searchAndSelectModel(
+    menuItems: Element[],
+    target: string,
+    menuItemSelector: string,
+    menuRenderDelay: number,
+    subMenuTriggers: string[],
+    subMenuSelector: string | undefined,
+    onSuccess?: () => void,
+  ): void {
+    const normalize = (str: string) => (str || "").toLowerCase().trim()
+
+    // 1. 在主菜单中查找（优先精确匹配）
+    const matchedItem = this.findBestMatchingItem(menuItems, target)
+    if (matchedItem) {
+      this.simulateClick(matchedItem as HTMLElement)
+      setTimeout(() => {
+        document.body.click()
+        if (onSuccess) onSuccess()
+      }, 100)
+      return
+    }
+
+    // 2. 尝试子菜单
+    // 优先使用 selector（语言无关），文字匹配作为备选
+    let subMenuItem: Element | undefined
+
+    // 2a. 优先通过 selector 查找（如 aria-haspopup="menu"）
+    if (subMenuSelector) {
+      subMenuItem = menuItems.find((item) => item.matches(subMenuSelector))
+    }
+
+    // 2b. 备选：通过文字关键字匹配
+    if (!subMenuItem && subMenuTriggers.length > 0) {
+      subMenuItem = menuItems.find((item) => {
+        const text = normalize(item.textContent || "")
+        return subMenuTriggers.some((trigger) => text.includes(normalize(trigger)))
+      })
+    }
+
+    if (subMenuItem) {
+      this.simulateClick(subMenuItem as HTMLElement)
+
+      setTimeout(() => {
+        const subItems = this.getVisibleMenuItems(menuItemSelector, subMenuItem as HTMLElement)
+        const matchedSubItem = this.findBestMatchingItem(subItems, target)
+        if (matchedSubItem) {
+          this.simulateClick(matchedSubItem as HTMLElement)
+          setTimeout(() => {
+            document.body.click()
+            if (onSuccess) onSuccess()
+          }, 100)
+          return
+        }
+
+        // 子菜单中也没找到
+        document.body.click()
+        console.warn(`Ophel: Model "${target}" not found in sub-menu.`)
+        this.showModelLockFailure(target, "not_found")
+      }, menuRenderDelay)
+      return
+    }
+
+    // 3. 主菜单和子菜单都没找到
+    document.body.click()
+    console.warn(`Ophel: Model "${target}" not found in menu.`)
+    this.showModelLockFailure(target, "not_found")
+  }
+
+  private getVisibleMenuItems(menuItemSelector: string, anchor?: HTMLElement): Element[] {
+    const items = this.getVisibleElementsBySelector(menuItemSelector)
+    if (!anchor || items.length === 0) return items
+
+    const ariaContainer = this.getMenuContainerByAria(anchor)
+    if (ariaContainer) {
+      const scoped = items.filter((item) => ariaContainer.contains(item))
+      if (scoped.length > 0) return scoped
+    }
+
+    const containerSelector = this.getMenuContainerSelector()
+    const containerMap = new Map<Element, Element[]>()
+
+    for (const item of items) {
+      const container = item.closest(containerSelector)
+      if (!container || !this.isElementVisible(container)) continue
+      const list = containerMap.get(container)
+      if (list) list.push(item)
+      else containerMap.set(container, [item])
+    }
+
+    if (containerMap.size > 0) {
+      const bestContainer = this.pickBestMenuContainer(anchor, containerMap)
+      if (bestContainer) {
+        return containerMap.get(bestContainer) || items
+      }
+    }
+
+    return items
+  }
+
+  private getVisibleElementsBySelector(selector: string): Element[] {
+    return (
+      (DOMToolkit.query(selector, {
+        all: true,
+        shadow: true,
+        filter: (el) => this.isElementVisible(el),
+      }) as Element[]) || []
+    )
+  }
+
+  private getMenuContainerByAria(anchor: HTMLElement): Element | null {
+    const menuId = anchor.getAttribute("aria-controls") || anchor.getAttribute("aria-owns")
+    if (!menuId) return null
+    const selector = `#${this.escapeSelector(menuId)}`
+    const container = DOMToolkit.query(selector, { shadow: true }) as Element | null
+    if (container && this.isElementVisible(container)) return container
+    return null
+  }
+
+  private getMenuContainerSelector(): string {
+    return [
+      '[role="menu"]',
+      '[role="listbox"]',
+      "md-menu-surface",
+      ".mdc-menu-surface",
+      ".mat-menu-panel",
+      ".menu[popover]",
+      "[data-radix-popper-content-wrapper]",
+      ".cdk-overlay-pane",
+    ].join(", ")
+  }
+
+  private pickBestMenuContainer(
+    anchor: HTMLElement,
+    containerMap: Map<Element, Element[]>,
+  ): Element | null {
+    const anchorRect = anchor.getBoundingClientRect()
+    let best: {
+      container: Element
+      distance: number
+      count: number
+    } | null = null
+
+    containerMap.forEach((items, container) => {
+      if (items.length === 0) return
+      const rect = (container as HTMLElement).getBoundingClientRect()
+      const distance = this.getRectDistance(anchorRect, rect)
+      if (
+        !best ||
+        distance < best.distance - 1 ||
+        (Math.abs(distance - best.distance) <= 1 && items.length > best.count)
+      ) {
+        best = { container, distance, count: items.length }
+      }
+    })
+
+    return best ? best.container : null
+  }
+
+  private getRectDistance(a: DOMRect, b: DOMRect): number {
+    const dx = Math.max(a.left - b.right, b.left - a.right, 0)
+    const dy = Math.max(a.top - b.bottom, b.top - a.bottom, 0)
+    return Math.sqrt(dx * dx + dy * dy)
+  }
+
+  private isElementVisible(element: Element | null): boolean {
+    if (!element) return false
+    const htmlEl = element as HTMLElement
+    if (!htmlEl.isConnected) return false
+    const style = window.getComputedStyle(htmlEl)
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      parseFloat(style.opacity) === 0
+    ) {
+      return false
+    }
+    const rect = htmlEl.getBoundingClientRect()
+    return rect.width > 0 && rect.height > 0
+  }
+
+  private escapeSelector(value: string): string {
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+      return CSS.escape(value)
+    }
+    return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&")
+  }
+
+  /**
+   * 查找最佳匹配的菜单项
+   * 匹配优先级：精确匹配 > 结尾匹配 > 包含匹配
+   * 这确保 "gpt-5.1" 会匹配 "GPT-5.1" 而不是 "GPT-5.1 Instant"
+   */
+  private findBestMatchingItem(menuItems: Element[], target: string): Element | undefined {
+    const normalize = (str: string) => (str || "").toLowerCase().trim()
+
+    // 优先级1: 精确匹配（文本完全相等，或去掉描述后相等）
+    for (const item of menuItems) {
+      const itemText = normalize(item.textContent || (item as HTMLElement).innerText || "")
+      // 有些菜单项包含描述文字，提取第一行/主要文本
+      const mainText = itemText.split("\n")[0].trim()
+      if (mainText === target || itemText === target) {
+        return item
+      }
+    }
+
+    // 优先级2: 结尾匹配（目标是菜单项文本的结尾部分）
+    // 例如 target="5.1" 匹配 "gpt-5.1" 但不匹配 "gpt-5.1 instant"
+    for (const item of menuItems) {
+      const itemText = normalize(item.textContent || (item as HTMLElement).innerText || "")
+      const mainText = itemText.split("\n")[0].trim()
+      if (mainText.endsWith(target)) {
+        return item
+      }
+    }
+
+    // 优先级3: 包含匹配（作为最后的备选）
+    for (const item of menuItems) {
+      const itemText = normalize(item.textContent || (item as HTMLElement).innerText || "")
+      if (itemText.includes(target)) {
+        return item
+      }
+    }
+
+    return undefined
+  }
+
+  /**
+   * 显示模型锁定失败的 Toast 提示
+   */
+  private async showModelLockFailure(
+    keyword: string,
+    reason: "button_not_found" | "menu_empty" | "not_found",
+  ): Promise<void> {
+    try {
+      const { showToast } = await import("~utils/toast")
+      const { t } = await import("~utils/i18n")
+
+      let message: string
+      switch (reason) {
+        case "button_not_found":
+          message = t("modelLockFailedNoButton")
+          break
+        case "menu_empty":
+          message = t("modelLockFailedMenuEmpty")
+          break
+        case "not_found":
+        default:
+          message = t("modelLockFailedNotFound").replace("{model}", keyword)
+      }
+
+      showToast(message, 3000)
+    } catch (e) {
+      // Toast 加载失败时静默处理
+      console.error("Ophel: Failed to show toast:", e)
+    }
+  }
+
+  /** 通过选择器列表查找单个元素（支持 Shadow DOM 穿透） */
+  findElementBySelectors(selectors: string[]): HTMLElement | null {
+    return DOMToolkit.query(selectors, { shadow: true }) as HTMLElement | null
+  }
+
+  /** 通过选择器查找所有元素（支持 Shadow DOM 穿透） */
+  findAllElementsBySelector(selector: string): Element[] {
+    return (DOMToolkit.query(selector, { all: true, shadow: true }) as Element[]) || []
+  }
+
+  // ==================== 生命周期 ====================
+
+  /** 页面加载完成后执行 */
+  afterPropertiesSet(
+    options: { modelLockConfig?: { enabled: boolean; keyword: string } } = {},
+  ): void {
+    const { modelLockConfig } = options
+    if (modelLockConfig && modelLockConfig.enabled) {
+      this.lockModel(modelLockConfig.keyword)
+    }
+  }
+
+  /** 判断是否应该将样式注入到指定的 Shadow Host 中（默认排除 Ophel 自身的 UI 容器） */
+  shouldInjectIntoShadow(host: Element): boolean {
+    if (
+      host.tagName.toLowerCase() === "plasmo-csui" ||
+      host.id === "ophel-userscript-root" ||
+      host.classList.contains("plasmo-csui-container") ||
+      host.closest("plasmo-csui, #ophel-userscript-root, .plasmo-csui-container") !== null
+    ) {
+      return false
+    }
+    return true
+  }
+
+  protected findVisibleElementBySelectors(selectors: string[]): HTMLElement | null {
+    if (selectors.length === 0) {
+      return null
+    }
+
+    const matched = DOMToolkit.query(selectors, {
+      all: true,
+      shadow: true,
+      filter: (element) => this.isElementVisible(element),
+    }) as Element[]
+
+    for (const element of matched || []) {
+      if (!(element instanceof HTMLElement)) continue
+
+      const clickable = this.resolveClickableTarget(element)
+      if (clickable && this.isElementVisible(clickable)) {
+        return clickable
+      }
+    }
+
+    return null
+  }
+
+  protected extractLastFencedCodeBlockText(markdown: string): string | null {
+    if (!markdown) {
+      return null
+    }
+
+    const pattern = /```[^\n]*\n([\s\S]*?)```/g
+    let lastMatch: string | null = null
+
+    for (const match of markdown.matchAll(pattern)) {
+      lastMatch = match[1] || null
+    }
+
+    if (!lastMatch || !lastMatch.trim()) {
+      return null
+    }
+
+    return lastMatch.replace(/\r\n/g, "\n").replace(/\n+$/, "")
+  }
+
+  protected extractLastCodeBlockTextFromDomRoot(root: ParentNode): string | null {
+    const candidates =
+      (DOMToolkit.query("pre code, pre, pre.code-block, .code-block code", {
+        parent: root as Node,
+        all: true,
+        shadow: true,
+        filter: (element) => this.shouldIncludeCodeElement(element),
+      }) as Element[]) || []
+
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      const candidate = candidates[i]
+      if (!(candidate instanceof HTMLElement)) continue
+
+      const clone = candidate.cloneNode(true) as HTMLElement
+      clone
+        .querySelectorAll(
+          'button, [role="button"], svg, [aria-hidden="true"], .gh-copy-btn, [data-testid*="copy"]',
+        )
+        .forEach((node) => node.remove())
+
+      const text = clone.textContent?.replace(/\r\n/g, "\n").replace(/\n+$/, "") || ""
+      if (text.trim()) {
+        return text
+      }
+    }
+
+    return null
+  }
+
+  protected getAssistantResponseElementsForCodeSearch(): Element[] {
+    const config = this.getExportConfig()
+    if (!config?.assistantResponseSelector) {
+      return []
+    }
+
+    return (
+      (DOMToolkit.query(config.assistantResponseSelector, {
+        parent: this.getPrimaryCodeSearchRoot() as Node,
+        all: true,
+        shadow: true,
+        filter: (element) => this.shouldIncludeAssistantResponseElement(element),
+      }) as Element[]) || []
+    )
+  }
+
+  protected getPrimaryCodeSearchRoot(): ParentNode {
+    const containerSelector = this.getResponseContainerSelector()
+    if (containerSelector) {
+      const container = DOMToolkit.query(containerSelector, { shadow: true }) as ParentNode | null
+      if (container) {
+        return container
+      }
+    }
+
+    return this.getScrollContainer() || document
+  }
+
+  protected resolveClickableTarget(element: HTMLElement | null): HTMLElement | null {
+    if (!element) {
+      return null
+    }
+
+    if (element.matches("button, a, [role='button'], [tabindex], md-icon-button, ms-stop-button")) {
+      return element
+    }
+
+    return (
+      (element.closest(
+        "button, a, [role='button'], [tabindex], md-icon-button, ms-stop-button",
+      ) as HTMLElement | null) || element
+    )
+  }
+
+  protected shouldIncludeAssistantResponseElement(element: Element): boolean {
+    return (
+      !element.closest(
+        ".gh-root, .gh-user-query-markdown, .gh-markdown-preview, .gh-assistant-mermaid",
+      ) && this.isElementVisible(element)
+    )
+  }
+
+  protected shouldIncludeCodeElement(element: Element): boolean {
+    return (
+      !element.closest(
+        ".gh-root, .gh-user-query-markdown, .gh-markdown-preview, .gh-assistant-mermaid",
+      ) && this.isElementVisible(element)
+    )
+  }
+
+  protected navigateToNewConversationUrl(): boolean {
+    const targetUrl = this.getNewTabUrl()
+    if (!targetUrl) {
+      return false
+    }
+
+    try {
+      const resolvedTargetUrl = new URL(targetUrl, window.location.origin).href
+      if (resolvedTargetUrl === window.location.href && this.isNewConversation()) {
+        return true
+      }
+
+      window.location.href = resolvedTargetUrl
+      return true
+    } catch {
+      window.location.href = targetUrl
+      return true
+    }
+  }
+
+  protected captureConversationNavigationState(): {
+    href: string
+    sessionId: string
+    isNewConversation: boolean
+  } {
+    return {
+      href: window.location.href,
+      sessionId: this.getSessionId(),
+      isNewConversation: this.isNewConversation(),
+    }
+  }
+
+  protected hasConversationNavigationChanged(state: {
+    href: string
+    sessionId: string
+    isNewConversation: boolean
+  }): boolean {
+    return (
+      window.location.href !== state.href ||
+      this.getSessionId() !== state.sessionId ||
+      this.isNewConversation() !== state.isNewConversation
+    )
+  }
+}

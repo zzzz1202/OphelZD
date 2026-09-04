@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Ophel Atlas: KI-Chat-Manager & Gliederungen für ChatGPT/Claude/Gemini",
+    "description": "Extension name"
+  },
+  "extensionDescription": {
+    "message": "Gliederungen und Zeitleisten für KI-Chats per 1 Klick. Organisiere sie mit Ordnern, Exporten und Prompts.",
+    "description": "Extension description"
+  }
+}

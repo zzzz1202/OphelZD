@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Ophel Atlas: Менеджер ИИ-чатов и Навигатор для ChatGPT/Claude/Gemini",
+    "description": "Extension name"
+  },
+  "extensionDescription": {
+    "message": "Автооглавления и таймлайны для навигации по ИИ-чатам в 1 клик. Организуйте их с папками, экспортом и промптами.",
+    "description": "Extension description"
+  }
+}

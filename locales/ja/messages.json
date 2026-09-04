@@ -1,0 +1,10 @@
+{
+  "extensionName": {
+    "message": "Ophel Atlas：ChatGPT/Claude/Gemini チャット整理＆アウトラインナビ",
+    "description": "拡張機能名"
+  },
+  "extensionDescription": {
+    "message": "リアルタイムの目次とタイムラインを自動生成し、長いチャットもワンクリックでジャンプ。フォルダ分け、エクスポート、プロンプト集でAIチャットの検索・管理を劇的に効率化。主要プラットフォームに対応。",
+    "description": "拡張機能の説明"
+  }
+}

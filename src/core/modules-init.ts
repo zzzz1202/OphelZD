@@ -1,0 +1,984 @@
+/**
+ * 共享模块初始化逻辑
+ *
+ * 抽取自 contents/main.ts, 供浏览器扩展和油猴脚本复用
+ * 避免代码重复维护
+ */
+
+import type { SiteAdapter } from "~adapters/base"
+import { SITE_IDS } from "~constants"
+import { AssistantMermaidRenderer } from "~core/assistant-mermaid-renderer"
+import { ChatGptPerfManager } from "~core/chatgpt-perf-manager"
+import type { CoreModule } from "~core/core-module"
+import { CopyManager } from "~core/copy-manager"
+import { LayoutManager } from "~core/layout-manager"
+import { MarkdownFixer } from "~core/markdown-fixer"
+import { ModelLocker } from "~core/model-locker"
+import { PolicyRetryManager } from "~core/policy-retry-manager"
+import { ReadingHistoryManager } from "~core/reading-history"
+import { ScrollLockManager } from "~core/scroll-lock-manager"
+import { TabManager } from "~core/tab-manager"
+import { ThemeManager, ensureGlobalThemeManager } from "~core/theme-manager"
+import { UsageCounterManager } from "~core/usage-counter-manager"
+import { UserQueryMarkdownRenderer } from "~core/user-query-markdown"
+import { WatermarkRemover } from "~core/watermark-remover"
+import { getSettingsState, subscribeSettings } from "~stores/settings-store"
+import { setLanguage, t } from "~utils/i18n"
+import { EVENT_PAGE_URL_CHANGE } from "~utils/messaging"
+import {
+  getSiteModelLock,
+  getSitePanelAvoidance,
+  getSitePageWidth,
+  getSiteTheme,
+  getSiteUserQueryWidth,
+  getSiteZenMode,
+  getSiteCleanMode,
+  consumeClearAllFlag,
+  consumeSkipReadingHistoryRestoreFlag,
+  CLEAR_ALL_FLAG_TTL_MS,
+  type Settings,
+} from "~utils/storage"
+
+/**
+ * 模块初始化上下文
+ */
+export interface ModulesContext {
+  adapter: SiteAdapter
+  settings: Settings
+  siteId: string
+  siteInstanceKey: string
+  /**
+   * 可选中止信号：异步初始化期间适配器若已切换 / 离开，返回 true。
+   * 返回 true 时 initCoreModules 不再继续创建新模块（已建模块由 teardown 回收）。
+   */
+  isStale?: () => boolean
+}
+
+/**
+ * 模块管理器实例集合
+ */
+export interface ModuleInstances {
+  assistantMermaidRenderer: AssistantMermaidRenderer | null
+  chatgptPerfManager: ChatGptPerfManager | null
+  themeManager: ThemeManager | null
+  copyManager: CopyManager | null
+  layoutManager: LayoutManager | null
+  markdownFixer: MarkdownFixer | null
+  tabManager: TabManager | null
+  watermarkRemover: WatermarkRemover | null
+  readingHistoryManager: ReadingHistoryManager | null
+  modelLocker: ModelLocker | null
+  scrollLockManager: ScrollLockManager | null
+  userQueryMarkdownRenderer: UserQueryMarkdownRenderer | null
+  policyRetryManager: PolicyRetryManager | null
+  usageCounterManager: UsageCounterManager | null
+}
+
+// 全局模块实例（用于设置变更时的热更新）
+let modules: ModuleInstances = {
+  assistantMermaidRenderer: null,
+  chatgptPerfManager: null,
+  themeManager: null,
+  copyManager: null,
+  layoutManager: null,
+  markdownFixer: null,
+  tabManager: null,
+  watermarkRemover: null,
+  readingHistoryManager: null,
+  modelLocker: null,
+  scrollLockManager: null,
+  userQueryMarkdownRenderer: null,
+  policyRetryManager: null,
+  usageCounterManager: null,
+}
+
+let readingHistoryAutoStartTimer: ReturnType<typeof setTimeout> | null = null
+let assistantMermaidInitPromise: Promise<void> | null = null
+
+const startCoreModule = (module: Pick<CoreModule, "start">): void => {
+  module.start()
+}
+
+const updateCoreModule = <TUpdate>(module: CoreModule<TUpdate>, payload: TUpdate): void => {
+  module.update(payload)
+}
+
+const stopCoreModule = (module: Pick<CoreModule, "stop">): void => {
+  module.stop()
+}
+
+function isAssistantMermaidEnabled(settings: Settings): boolean {
+  return settings.content?.assistantMermaid ?? true
+}
+
+export async function initAssistantMermaidRenderer(ctx: ModulesContext): Promise<void> {
+  const { adapter, settings } = ctx
+
+  if (adapter.getAssistantMermaidSupportMode() !== "fallback") {
+    modules.assistantMermaidRenderer?.stop()
+    modules.assistantMermaidRenderer = null
+    return
+  }
+
+  if (!isAssistantMermaidEnabled(settings)) {
+    modules.assistantMermaidRenderer?.updateSettings(false)
+    return
+  }
+
+  if (modules.assistantMermaidRenderer) {
+    modules.assistantMermaidRenderer.updateSettings(true)
+    return
+  }
+
+  if (!assistantMermaidInitPromise) {
+    assistantMermaidInitPromise = (async () => {
+      if (adapter.getAssistantMermaidSupportMode() !== "fallback") {
+        return
+      }
+
+      if (!isAssistantMermaidEnabled(getSettingsState())) {
+        return
+      }
+
+      if (!modules.assistantMermaidRenderer) {
+        modules.assistantMermaidRenderer = new AssistantMermaidRenderer(adapter, true)
+      } else {
+        modules.assistantMermaidRenderer.updateSettings(true)
+      }
+    })().finally(() => {
+      assistantMermaidInitPromise = null
+    })
+  }
+
+  await assistantMermaidInitPromise
+}
+
+/**
+ * 初始化主题管理器
+ */
+export function initThemeManager(ctx: ModulesContext): ThemeManager {
+  const { adapter, settings, siteInstanceKey } = ctx
+  const siteTheme = getSiteTheme(settings, siteInstanceKey)
+
+  const themeManager = ensureGlobalThemeManager({
+    mode: siteTheme.mode,
+    adapter,
+    lightPresetId: siteTheme.lightStyleId || "google-gradient",
+    darkPresetId: siteTheme.darkStyleId || "classic-dark",
+    syncNativePageTheme: settings.theme?.syncNativePageTheme ?? true,
+    apply: true,
+  })
+
+  modules.themeManager = themeManager
+
+  return themeManager
+}
+
+/**
+ * 按 settings 校准宿主页主题。
+ * (恢复备份后，面板主题会正确应用，但宿主页本身的主题可能不一致)
+ */
+export async function syncHostThemeWithSettings(ctx: ModulesContext): Promise<void> {
+  const { adapter, settings, siteInstanceKey } = ctx
+  const siteTheme = getSiteTheme(settings, siteInstanceKey)
+  if (siteTheme.mode === "system" && modules.themeManager) {
+    await modules.themeManager.setMode("system")
+    return
+  }
+  const targetTheme =
+    siteTheme.mode === "system"
+      ? window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : siteTheme.mode === "dark"
+        ? "dark"
+        : "light"
+
+  if (!adapter.supportsHostThemeSync()) {
+    modules.themeManager?.applyTheme(targetTheme)
+    return
+  }
+
+  // 检测页面实际的主题状态
+  // 用 classList token 精确匹配，避免命中 Grok 常驻工具类（scheme-light / dark:scheme-dark）
+  const htmlHasDark = document.documentElement.classList.contains("dark")
+  const htmlHasLight = document.documentElement.classList.contains("light")
+  const bodyClass = document.body.className
+  const bodyHasDarkTheme = /\bdark-theme\b/i.test(bodyClass)
+  const pageColorScheme = document.body.style.colorScheme
+
+  // 判断页面实际主题
+  let actualPageTheme: "light" | "dark" = "light"
+  if (htmlHasDark || bodyHasDarkTheme || pageColorScheme === "dark") {
+    actualPageTheme = "dark"
+  } else if (htmlHasLight) {
+    actualPageTheme = "light"
+  }
+
+  // 如果不一致，需要同步主题
+  if (actualPageTheme !== targetTheme) {
+    if (modules.themeManager) {
+      modules.themeManager.applyTheme(targetTheme)
+    }
+    if (adapter && typeof adapter.toggleTheme === "function") {
+      await adapter.toggleTheme(targetTheme)
+    }
+  }
+}
+
+/**
+ * 获取站点的 Markdown 修复开关状态
+ */
+function getSiteMarkdownFix(settings: Settings, siteId: string): boolean {
+  switch (siteId) {
+    case SITE_IDS.GEMINI:
+      return settings.content?.markdownFix ?? false
+    case SITE_IDS.AISTUDIO:
+      return settings.aistudio?.markdownFix ?? false
+    case SITE_IDS.CHATGPT:
+      return settings.chatgpt?.markdownFix ?? false
+    default:
+      return false
+  }
+}
+
+/**
+ * 初始化 Markdown 修复器
+ */
+export function initMarkdownFixer(ctx: ModulesContext): void {
+  const { adapter, settings, siteId } = ctx
+  const config = adapter.getMarkdownFixerConfig()
+  const enabled = getSiteMarkdownFix(settings, siteId)
+
+  if (config && enabled) {
+    modules.markdownFixer = new MarkdownFixer(config)
+    modules.markdownFixer.start()
+    console.warn(`[Ophel] MarkdownFixer started for ${adapter.getName()}`)
+  }
+}
+
+/**
+ * 初始化布局管理器
+ */
+export function initLayoutManager(ctx: ModulesContext): void {
+  const { adapter, settings, siteInstanceKey } = ctx
+  const sitePageWidth = getSitePageWidth(settings, siteInstanceKey)
+  const siteUserQueryWidth = getSiteUserQueryWidth(settings, siteInstanceKey)
+  const siteZenMode = getSiteZenMode(settings, siteInstanceKey)
+  const zenModeEnabled = siteZenMode.enabled
+  const siteCleanMode = getSiteCleanMode(settings, siteInstanceKey)
+  const hasCleanConfig = !!adapter.getCleanModeConfig()
+  const cleanModeEnabled = hasCleanConfig && siteCleanMode.enabled
+  const hasPanelAvoidanceConfig = !!adapter.getPanelAvoidanceConfig()
+  const panelAvoidanceEnabled =
+    hasPanelAvoidanceConfig && getSitePanelAvoidance(settings, siteInstanceKey).enabled
+
+  if (
+    sitePageWidth?.enabled ||
+    siteUserQueryWidth?.enabled ||
+    zenModeEnabled ||
+    cleanModeEnabled ||
+    panelAvoidanceEnabled
+  ) {
+    modules.layoutManager = new LayoutManager(adapter, sitePageWidth)
+    if (sitePageWidth?.enabled) modules.layoutManager.apply()
+    if (panelAvoidanceEnabled) modules.layoutManager.startPanelAvoidance()
+    if (siteUserQueryWidth?.enabled) modules.layoutManager.updateUserQueryConfig(siteUserQueryWidth)
+    if (zenModeEnabled) modules.layoutManager.updateZenMode(siteZenMode)
+    if (cleanModeEnabled) modules.layoutManager.updateCleanMode(true)
+  }
+}
+
+/**
+ * 初始化复制管理器
+ */
+export function initCopyManager(ctx: ModulesContext): void {
+  const { adapter, settings } = ctx
+
+  if (settings.content) {
+    modules.copyManager = new CopyManager(settings.content, adapter)
+    if (settings.content.formulaCopy) {
+      modules.copyManager.initFormulaCopy()
+    }
+    if (settings.content.tableCopy) {
+      modules.copyManager.initTableCopy()
+    }
+  }
+}
+
+/**
+ * 初始化标签页管理器
+ */
+export function initTabManager(ctx: ModulesContext): void {
+  const { adapter, settings } = ctx
+
+  // 始终初始化 TabManager，以便支持隐私模式切换和其他不需要 autoRename 的功能
+  if (settings.tab) {
+    modules.tabManager = new TabManager(adapter, settings.tab)
+    modules.tabManager.start()
+  }
+}
+
+/**
+ * 初始化本地使用量计数与预估面板
+ */
+export function initUsageCounterManager(ctx: ModulesContext): void {
+  const { adapter, settings, siteId } = ctx
+
+  modules.usageCounterManager = new UsageCounterManager(adapter, settings.usageMonitor, siteId)
+  modules.usageCounterManager.start()
+}
+
+/**
+ * 初始化水印移除器 (仅 Gemini)
+ */
+export function initWatermarkRemover(ctx: ModulesContext): void {
+  const { settings, siteId } = ctx
+
+  if (
+    (siteId === SITE_IDS.GEMINI || siteId === SITE_IDS.GEMINI_ENTERPRISE) &&
+    settings.content?.watermarkRemoval
+  ) {
+    modules.watermarkRemover = new WatermarkRemover()
+    modules.watermarkRemover.start()
+  }
+}
+
+/**
+ * 初始化 ChatGPT 长会话渲染性能优化 (仅 ChatGPT)
+ */
+export function initChatGptPerfManager(ctx: ModulesContext): void {
+  const { adapter, settings, siteId } = ctx
+
+  if (siteId !== SITE_IDS.CHATGPT) return
+
+  if (modules.chatgptPerfManager) {
+    modules.chatgptPerfManager.update(settings.chatgpt || {})
+    return
+  }
+
+  modules.chatgptPerfManager = new ChatGptPerfManager(adapter, settings.chatgpt || {})
+  modules.chatgptPerfManager.start()
+}
+
+/**
+ * 初始化阅读历史管理器
+ */
+export async function initReadingHistoryManager(ctx: ModulesContext): Promise<void> {
+  const { adapter, settings } = ctx
+
+  // 站点未声明 reading-history 能力时不启用阅读历史；
+  // 否则恢复滚动位置的逻辑可能干扰页内导航（如大纲标题跳转）。
+  if (!adapter.hasFeatureCapability("reading-history")) return
+
+  if (settings.readingHistory?.persistence) {
+    if (readingHistoryAutoStartTimer) {
+      clearTimeout(readingHistoryAutoStartTimer)
+      readingHistoryAutoStartTimer = null
+    }
+
+    const startRecording = (currentSettings: Settings) => {
+      // await consumeClearAllFlag() 期间适配器可能已切换并被 teardown 回收，
+      // 过期上下文不得再创建实例，否则旧适配器的实例会被后续站点直接复用
+      if (ctx.isStale?.()) return
+      if (modules.readingHistoryManager) return
+      modules.readingHistoryManager = new ReadingHistoryManager(
+        adapter,
+        currentSettings.readingHistory,
+      )
+      modules.readingHistoryManager.startRecording()
+      modules.readingHistoryManager.cleanup()
+    }
+
+    const skipAutoRestore = (await consumeClearAllFlag()) || consumeSkipReadingHistoryRestoreFlag()
+    if (skipAutoRestore) {
+      readingHistoryAutoStartTimer = setTimeout(() => {
+        readingHistoryAutoStartTimer = null
+        const currentSettings = getSettingsState()
+        if (currentSettings.readingHistory?.persistence && !modules.readingHistoryManager) {
+          startRecording(currentSettings)
+        }
+      }, CLEAR_ALL_FLAG_TTL_MS)
+      return
+    }
+
+    startRecording(settings)
+
+    // startRecording 可能因过期中止而未创建实例，这里必须判空
+    const manager = modules.readingHistoryManager
+    if (settings.readingHistory.autoRestore && manager) {
+      const { showToast } = await import("~utils/toast")
+      // await 期间适配器可能已切换并被 destroyCoreModules 回收，
+      // 注册表中已不再是该实例时不得再对旧适配器执行恢复
+      if (modules.readingHistoryManager !== manager) return
+      manager
+        .restoreProgress((msg) => showToast(msg, 3000))
+        .then((restored) => {
+          if (restored) {
+            showToast(t("restoredPosition"), 2000)
+          }
+        })
+    }
+
+    manager?.cleanup()
+  }
+}
+
+/**
+ * 初始化模型锁定器
+ */
+export function initModelLocker(ctx: ModulesContext): void {
+  const { adapter, settings, siteInstanceKey } = ctx
+  const siteModelConfig = getSiteModelLock(settings, siteInstanceKey)
+
+  modules.modelLocker = new ModelLocker(adapter, siteModelConfig)
+  if (siteModelConfig.enabled && siteModelConfig.keyword) {
+    modules.modelLocker.start()
+  }
+}
+
+/**
+ * 初始化滚动锁定管理器
+ */
+export function initScrollLockManager(ctx: ModulesContext): void {
+  const { adapter, settings } = ctx
+  if (modules.scrollLockManager) {
+    stopCoreModule(modules.scrollLockManager)
+  }
+  modules.scrollLockManager = new ScrollLockManager(adapter, settings)
+  startCoreModule(modules.scrollLockManager)
+}
+
+/**
+ * 初始化用户提问 Markdown 渲染器
+ */
+export function initUserQueryMarkdownRenderer(ctx: ModulesContext): void {
+  const { adapter, settings } = ctx
+  modules.userQueryMarkdownRenderer = new UserQueryMarkdownRenderer(
+    adapter,
+    settings.content?.userQueryMarkdown ?? true,
+  )
+}
+
+/**
+ * 初始化所有核心模块
+ */
+export async function initCoreModules(ctx: ModulesContext): Promise<ModuleInstances> {
+  // 异步步骤之间适配器可能已被切换/清空（SPA 导航），过期初始化不得再创建新实例
+  const isAborted = () => ctx.isStale?.() === true
+
+  // 等待 hydration 期间 teardown 可能已执行，入口先拦截，避免步骤 1-7 无条件建实例
+  if (isAborted()) return modules
+
+  // 1. 主题管理 (优先应用)
+  initThemeManager(ctx)
+
+  // 延迟同步页面主题
+  setTimeout(() => {
+    if (!isAborted()) void syncHostThemeWithSettings(ctx)
+  }, 1000)
+
+  // 2. Markdown 修复
+  initMarkdownFixer(ctx)
+
+  // 3. 页面宽度管理
+  initLayoutManager(ctx)
+
+  // 4. 复制功能
+  initCopyManager(ctx)
+
+  // 5. 标签页管理
+  initTabManager(ctx)
+
+  // 6. 水印移除
+  initWatermarkRemover(ctx)
+
+  // 7. 本地使用量计数与预估
+  initUsageCounterManager(ctx)
+
+  // 8. 阅读历史
+  await initReadingHistoryManager(ctx)
+  if (isAborted()) return modules
+
+  // 9. 模型锁定
+  initModelLocker(ctx)
+
+  // 10. 滚动锁定
+  initScrollLockManager(ctx)
+
+  // 11. 用户提问 Markdown 渲染
+  initUserQueryMarkdownRenderer(ctx)
+
+  // 12. AI 回复 Mermaid 渲染
+  await initAssistantMermaidRenderer(ctx)
+  if (isAborted()) return modules
+
+  // 13. Policy Retry Manager
+  initPolicyRetryManager(ctx)
+
+  // 14. ChatGPT 长会话渲染性能优化
+  initChatGptPerfManager(ctx)
+
+  return modules
+}
+
+/**
+ * 初始化 Policy Retry Manager
+ */
+export function initPolicyRetryManager(ctx: ModulesContext): void {
+  const { adapter, settings, siteId } = ctx
+  if (siteId === SITE_IDS.GEMINI_ENTERPRISE) {
+    modules.policyRetryManager = new PolicyRetryManager(
+      adapter,
+      settings.geminiEnterprise?.policyRetry || { enabled: false, maxRetries: 3 },
+    )
+  }
+}
+
+/**
+ * 订阅设置变化，动态更新模块
+ */
+export function subscribeModuleUpdates(ctx: ModulesContext): () => void {
+  const { adapter, siteId, siteInstanceKey } = ctx
+  let lastLanguage = getSettingsState().language
+
+  return subscribeSettings((newSettings: Settings) => {
+    if (newSettings.language && newSettings.language !== lastLanguage) {
+      lastLanguage = newSettings.language
+      setLanguage(newSettings.language)
+      modules.assistantMermaidRenderer?.refreshLocalizedTexts()
+      modules.layoutManager?.refreshLocalizedTexts()
+    }
+
+    // 1. Theme Manager - 只更新主题预置
+    const newSiteTheme = getSiteTheme(newSettings, siteInstanceKey)
+    if (newSiteTheme && modules.themeManager) {
+      modules.themeManager.setNativeThemeOverrideEnabled(
+        newSettings.theme?.syncNativePageTheme ?? true,
+      )
+      modules.themeManager.setPresets(
+        newSiteTheme.lightStyleId || "google-gradient",
+        newSiteTheme.darkStyleId || "classic-dark",
+      )
+    }
+
+    // 2. Model Locker update
+    const newModelConfig = getSiteModelLock(newSettings, siteInstanceKey)
+    if (newModelConfig && modules.modelLocker) {
+      modules.modelLocker.updateConfig(newModelConfig)
+    }
+
+    // 3. Scroll Lock update
+    if (newSettings && modules.scrollLockManager) {
+      updateCoreModule(modules.scrollLockManager, newSettings)
+    }
+
+    // 4. Markdown Fix update
+    const config = adapter.getMarkdownFixerConfig()
+    const markdownFixEnabled = getSiteMarkdownFix(newSettings, siteId)
+
+    if (config && markdownFixEnabled) {
+      if (!modules.markdownFixer) {
+        modules.markdownFixer = new MarkdownFixer(config)
+      }
+      modules.markdownFixer.start()
+    } else {
+      modules.markdownFixer?.stop()
+    }
+
+    // 5. Layout Manager update
+    const newSitePageWidth = getSitePageWidth(newSettings, siteInstanceKey)
+    const newUserQueryWidth = getSiteUserQueryWidth(newSettings, siteInstanceKey)
+    const newSiteZenMode = getSiteZenMode(newSettings, siteInstanceKey)
+    const newZenModeEnabled = newSiteZenMode.enabled
+    const newSiteCleanMode = getSiteCleanMode(newSettings, siteInstanceKey)
+    const hasCleanConfig = !!adapter.getCleanModeConfig()
+    const newCleanModeEnabled = hasCleanConfig && newSiteCleanMode.enabled
+    const hasPanelAvoidanceConfig = !!adapter.getPanelAvoidanceConfig()
+    const panelAvoidanceEnabled =
+      hasPanelAvoidanceConfig && getSitePanelAvoidance(newSettings, siteInstanceKey).enabled
+
+    if (modules.layoutManager) {
+      modules.layoutManager.updateConfig(newSitePageWidth)
+      if (panelAvoidanceEnabled) {
+        modules.layoutManager.startPanelAvoidance()
+      } else {
+        modules.layoutManager.stopPanelAvoidance()
+      }
+      modules.layoutManager.updateUserQueryConfig(newUserQueryWidth)
+      modules.layoutManager.updateZenMode(newSiteZenMode)
+      modules.layoutManager.updateCleanMode(newCleanModeEnabled)
+    } else if (
+      newSitePageWidth?.enabled ||
+      newUserQueryWidth?.enabled ||
+      newZenModeEnabled ||
+      newCleanModeEnabled ||
+      panelAvoidanceEnabled
+    ) {
+      modules.layoutManager = new LayoutManager(adapter, newSitePageWidth)
+      if (newSitePageWidth?.enabled) modules.layoutManager.apply()
+      if (panelAvoidanceEnabled) modules.layoutManager.startPanelAvoidance()
+      if (newUserQueryWidth?.enabled) modules.layoutManager.updateUserQueryConfig(newUserQueryWidth)
+      if (newZenModeEnabled) modules.layoutManager.updateZenMode(newSiteZenMode)
+      if (newCleanModeEnabled) modules.layoutManager.updateCleanMode(true)
+    }
+
+    // 6. Watermark Remover update
+    if (newSettings && (siteId === SITE_IDS.GEMINI || siteId === SITE_IDS.GEMINI_ENTERPRISE)) {
+      if (newSettings.content?.watermarkRemoval) {
+        if (!modules.watermarkRemover) {
+          modules.watermarkRemover = new WatermarkRemover()
+        }
+        modules.watermarkRemover.start()
+      } else {
+        modules.watermarkRemover?.stop()
+      }
+    }
+
+    // 7. Tab Manager update
+    if (newSettings?.tab) {
+      if (modules.tabManager) {
+        modules.tabManager.updateSettings(newSettings.tab)
+      } else {
+        modules.tabManager = new TabManager(adapter, newSettings.tab)
+        modules.tabManager.start()
+      }
+    }
+
+    // 8. Usage Counter update
+    if (newSettings?.usageMonitor) {
+      if (modules.usageCounterManager) {
+        modules.usageCounterManager.updateSettings(newSettings.usageMonitor)
+      } else {
+        modules.usageCounterManager = new UsageCounterManager(
+          adapter,
+          newSettings.usageMonitor,
+          siteId,
+        )
+        modules.usageCounterManager.start()
+      }
+    }
+
+    // 9. Reading History update
+    if (newSettings?.readingHistory) {
+      if (modules.readingHistoryManager) {
+        modules.readingHistoryManager.updateSettings(newSettings.readingHistory)
+      } else if (
+        newSettings.readingHistory.persistence &&
+        adapter.hasFeatureCapability("reading-history")
+      ) {
+        modules.readingHistoryManager = new ReadingHistoryManager(
+          adapter,
+          newSettings.readingHistory,
+        )
+        modules.readingHistoryManager.startRecording()
+      }
+    }
+
+    // 10. Copy Manager update
+    if (newSettings?.content) {
+      if (modules.copyManager) {
+        modules.copyManager.updateSettings(newSettings.content)
+      } else {
+        modules.copyManager = new CopyManager(newSettings.content)
+        if (newSettings.content.formulaCopy) modules.copyManager.initFormulaCopy()
+        if (newSettings.content.tableCopy) modules.copyManager.initTableCopy()
+      }
+
+      // 11. User Query Markdown Renderer update
+      if (newSettings.content.userQueryMarkdown) {
+        if (modules.userQueryMarkdownRenderer) {
+          modules.userQueryMarkdownRenderer.updateSettings(true)
+        } else {
+          modules.userQueryMarkdownRenderer = new UserQueryMarkdownRenderer(adapter, true)
+        }
+      } else {
+        modules.userQueryMarkdownRenderer?.updateSettings(false)
+      }
+    }
+
+    // 12. Assistant Mermaid Renderer update
+    void initAssistantMermaidRenderer({
+      adapter,
+      settings: newSettings,
+      siteId,
+      siteInstanceKey,
+    }).catch((error) => {
+      console.error("[Ophel] Assistant Mermaid renderer update failed:", error)
+    })
+
+    // 13. Policy Retry Manager update
+    if (
+      newSettings?.geminiEnterprise &&
+      siteId === SITE_IDS.GEMINI_ENTERPRISE &&
+      modules.policyRetryManager
+    ) {
+      modules.policyRetryManager.updateSettings(
+        newSettings.geminiEnterprise?.policyRetry || { enabled: false, maxRetries: 3 },
+      )
+    }
+
+    // 14. ChatGPT 长会话渲染性能优化 update
+    if (siteId === SITE_IDS.CHATGPT && newSettings?.chatgpt) {
+      if (modules.chatgptPerfManager) {
+        modules.chatgptPerfManager.update(newSettings.chatgpt)
+      } else {
+        modules.chatgptPerfManager = new ChatGptPerfManager(adapter, newSettings.chatgpt)
+        modules.chatgptPerfManager.start()
+      }
+    }
+  })
+}
+
+let globalUrlChangeBroadcasterStarted = false
+let broadcasterRefCount = 0
+let broadcasterCleanup: (() => void) | null = null
+
+/**
+ * 启动页面级 URL 变化单例广播器（支持 SPA 导航，分发 EVENT_PAGE_URL_CHANGE 事件）
+ */
+export function startPageUrlChangeBroadcaster(): () => void {
+  broadcasterRefCount++
+  if (globalUrlChangeBroadcasterStarted && broadcasterCleanup) {
+    return () => {
+      broadcasterRefCount--
+      if (broadcasterRefCount <= 0) {
+        broadcasterCleanup?.()
+        broadcasterCleanup = null
+        globalUrlChangeBroadcasterStarted = false
+        broadcasterRefCount = 0
+      }
+    }
+  }
+
+  globalUrlChangeBroadcasterStarted = true
+  let lastHref = window.location.href
+
+  const broadcastUrlChange = () => {
+    const currentHref = window.location.href
+    if (currentHref === lastHref) return
+
+    const previousHref = lastHref
+    lastHref = currentHref
+
+    window.dispatchEvent(
+      new CustomEvent(EVENT_PAGE_URL_CHANGE, {
+        detail: {
+          href: currentHref,
+          previousHref,
+        },
+      }),
+    )
+  }
+
+  window.addEventListener("popstate", broadcastUrlChange)
+  window.addEventListener("hashchange", broadcastUrlChange)
+
+  const originalPushState = history.pushState
+  const originalReplaceState = history.replaceState
+  const patchedPushState = function (this: History, ...args: Parameters<History["pushState"]>) {
+    originalPushState.apply(this, args)
+    broadcastUrlChange()
+  }
+  const patchedReplaceState = function (
+    this: History,
+    ...args: Parameters<History["replaceState"]>
+  ) {
+    originalReplaceState.apply(this, args)
+    broadcastUrlChange()
+  }
+  history.pushState = patchedPushState
+  history.replaceState = patchedReplaceState
+
+  const intervalId = window.setInterval(broadcastUrlChange, 1000)
+
+  broadcasterCleanup = () => {
+    window.removeEventListener("popstate", broadcastUrlChange)
+    window.removeEventListener("hashchange", broadcastUrlChange)
+    window.clearInterval(intervalId)
+
+    if (history.pushState === patchedPushState) {
+      history.pushState = originalPushState
+    }
+    if (history.replaceState === patchedReplaceState) {
+      history.replaceState = originalReplaceState
+    }
+  }
+
+  return () => {
+    broadcasterRefCount--
+    if (broadcasterRefCount <= 0) {
+      broadcasterCleanup?.()
+      broadcasterCleanup = null
+      globalUrlChangeBroadcasterStarted = false
+      broadcasterRefCount = 0
+    }
+  }
+}
+
+/**
+ * 初始化 URL 变化监听 (SPA 导航)
+ */
+export function initUrlChangeObserver(ctx: ModulesContext): () => void {
+  const { adapter } = ctx
+
+  let lastPathname = window.location.pathname
+  let readingHistoryRestoreRequestId = 0
+
+  const handleUrlChange = async () => {
+    const currentPathname = window.location.pathname
+    if (currentPathname === lastPathname) return
+
+    lastPathname = currentPathname
+    console.warn("[Ophel] URL changed, reinitializing modules...")
+
+    // 1. 阅读历史：停止录制 → 在可取消的稳定等待后恢复并重启
+    const restoreRequestId = ++readingHistoryRestoreRequestId
+    const readingHistoryManager = modules.readingHistoryManager
+    if (readingHistoryManager) {
+      readingHistoryManager.stopRecording()
+      const toastModulePromise = import("~utils/toast")
+
+      void (async () => {
+        const shouldSkipRestore = consumeSkipReadingHistoryRestoreFlag()
+        let restored = false
+
+        if (!shouldSkipRestore) {
+          restored = await readingHistoryManager.restoreProgress(
+            (msg) => {
+              void toastModulePromise.then(({ showToast }) => showToast(msg, 3000))
+            },
+            { delayMs: 1500 },
+          )
+        }
+
+        if (
+          restoreRequestId !== readingHistoryRestoreRequestId ||
+          modules.readingHistoryManager !== readingHistoryManager
+        ) {
+          return
+        }
+
+        if (restored) {
+          const { showToast } = await toastModulePromise
+          if (restoreRequestId !== readingHistoryRestoreRequestId) return
+          showToast(t("restoredPosition"), 2000)
+        }
+
+        readingHistoryManager.startRecording()
+      })()
+    }
+
+    // 2. 大纲刷新 - 通过全局事件通知 App.tsx
+    window.dispatchEvent(new Event("gh-url-change"))
+
+    // 3. 标签页标题更新
+    if (modules.tabManager) {
+      modules.tabManager.resetConversationTitleCache()
+      ;[300, 800, 1500].forEach((delay) =>
+        setTimeout(() => modules.tabManager?.updateTabName(true), delay),
+      )
+    }
+
+    // 4. Textarea 重新查找
+    adapter.findTextarea()
+
+    // 5. 本地计数面板重新挂载
+    modules.usageCounterManager?.handleUrlChange()
+
+    // 6. 模型锁定重新触发（新对话/新页面可能重置模型）
+    modules.modelLocker?.relock(300)
+  }
+
+  const stopBroadcaster = startPageUrlChangeBroadcaster()
+  window.addEventListener(EVENT_PAGE_URL_CHANGE, handleUrlChange)
+
+  return () => {
+    window.removeEventListener(EVENT_PAGE_URL_CHANGE, handleUrlChange)
+    stopBroadcaster()
+    readingHistoryRestoreRequestId++
+  }
+}
+
+declare const __PLATFORM__: "extension" | "userscript" | undefined
+
+/**
+ * 停止并释放全部核心模块（适配器切换 / 站点离开时使用）。
+ *
+ * initCoreModules 只负责创建与覆盖引用，旧实例的监听器和观察者不会自己消失，
+ * 必须在这里逐个停掉；主题管理器是跨适配器复用的全局单例，不在本函数范围内。
+ */
+export function destroyCoreModules(): void {
+  if (readingHistoryAutoStartTimer) {
+    clearTimeout(readingHistoryAutoStartTimer)
+    readingHistoryAutoStartTimer = null
+  }
+
+  modules.assistantMermaidRenderer?.stop()
+  modules.chatgptPerfManager?.stop()
+  modules.copyManager?.stop()
+  modules.layoutManager?.stop()
+  modules.markdownFixer?.stop()
+  modules.tabManager?.destroy()
+  modules.watermarkRemover?.stop()
+  modules.readingHistoryManager?.stopRecording()
+  modules.modelLocker?.stop()
+  modules.scrollLockManager?.stop()
+  modules.userQueryMarkdownRenderer?.destroy()
+  modules.policyRetryManager?.stop()
+  modules.usageCounterManager?.destroy()
+
+  modules = {
+    assistantMermaidRenderer: null,
+    chatgptPerfManager: null,
+    themeManager: modules.themeManager,
+    copyManager: null,
+    layoutManager: null,
+    markdownFixer: null,
+    tabManager: null,
+    watermarkRemover: null,
+    readingHistoryManager: null,
+    modelLocker: null,
+    scrollLockManager: null,
+    userQueryMarkdownRenderer: null,
+    policyRetryManager: null,
+    usageCounterManager: null,
+  }
+}
+
+/**
+ * 清除全部数据时的模块清理
+ */
+export function handleClearAllData(): void {
+  if (readingHistoryAutoStartTimer) {
+    clearTimeout(readingHistoryAutoStartTimer)
+    readingHistoryAutoStartTimer = null
+  }
+  if (modules.readingHistoryManager) {
+    modules.readingHistoryManager.stopRecording()
+    modules.readingHistoryManager = null
+  }
+  if (modules.usageCounterManager) {
+    modules.usageCounterManager.destroy()
+    modules.usageCounterManager = null
+  }
+
+  try {
+    const isUserscript = typeof __PLATFORM__ !== "undefined" && __PLATFORM__ === "userscript"
+    if (isUserscript) {
+      localStorage.removeItem("ophel_us_theme_cache")
+    } else {
+      localStorage.removeItem("ophel_ext_theme_cache")
+    }
+    localStorage.removeItem("ophel:global-search-shortcut-nudge:v1")
+  } catch (e) {
+    console.warn("Failed to clear theme cache from localStorage:", e)
+  }
+}
+
+/**
+ * 获取当前模块实例
+ */
+export function getModuleInstances(): ModuleInstances {
+  return modules
+}

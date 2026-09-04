@@ -1,0 +1,1045 @@
+import { type SiteAdapter } from "~adapters/base"
+import { NOTIFICATION_SOUND_PRESETS } from "~constants"
+import { platform } from "~platform"
+import {
+  forgetStaleManagedTabTitle,
+  forgetManagedTabTitle,
+  formatManagedTabTitle,
+  getRememberedManagedTabTitle,
+  normalizeConversationTitle,
+  rememberStaleManagedTabTitle,
+  rememberManagedTabTitle,
+  sanitizeConversationTitleCandidate,
+} from "~utils/conversation-title"
+import { t } from "~utils/i18n"
+import {
+  EVENT_MONITOR_COMPLETE,
+  EVENT_MONITOR_INIT,
+  EVENT_MONITOR_START,
+  type MonitorEventPayload,
+} from "~utils/messaging"
+import { type Settings } from "~utils/storage"
+
+const BACKGROUND_IDLE_TITLE_UPDATE_INTERVAL_MS = 15_000
+const DEFAULT_RENAME_INTERVAL_SECONDS = 5
+
+export class TabManager {
+  private adapter: SiteAdapter
+  private settings: Settings["tab"]
+  private isRunning = false
+  private intervalId: ReturnType<typeof setTimeout> | null = null
+  private titleObserver: MutationObserver | null = null
+  private expectedTitle: string | null = null
+  private isApplyingManagedTitle = false
+  private titleSyncTimer: number | null = null
+
+  // AI 生成状态（简化的状态机）
+  private aiState: "idle" | "generating" | "completed" = "idle"
+  private lastAiState: "idle" | "generating" | "completed" = "idle"
+  private currentNetworkGenerationPending = false
+  private currentNetworkGenerationConfirmed = false
+  private generationConfirmationIntervalId: number | null = null
+  private currentGenerationUsesDomCompletion = false
+  private currentDomCompletionObservedStart = false
+  private domCompletionIntervalId: number | null = null
+  private domCompletionTrackingStartedAt = 0
+
+  // 用户是否在前台看到过生成完成（用于避免误发通知）
+  private userSawCompletion = false
+
+  // 用户是否已查看过本轮生成完成的结果（用于 hideStatusWhenRead 功能）
+  // true = 用户已查看，不应再显示 ✅；false = 用户尚未查看，可显示 ✅
+  private completionViewed = false
+
+  // 对话标题缓存（避免读取被污染的标签页标题）
+  private lastConversationTitle: string | null = null
+  private staleManagedTitleAfterRouteChange: string | null = null
+  private staleConversationTitleAfterRouteChange: string | null = null
+
+  // 通知声音
+  private notificationAudio: HTMLAudioElement | null = null
+  private notificationRepeatTimer: number | null = null
+  private notificationPlaybackId = 0
+
+  // 绑定的事件处理函数引用（用于移除）
+  private boundHandleMessage: (event: MessageEvent) => void
+  private boundVisibilityHandler: () => void
+  private boundFocusHandler: () => void
+  private boundBlurHandler: () => void
+  private readonly handleTitleUpdateTimer = () => {
+    this.intervalId = null
+    if (!this.isRunning) return
+
+    this.updateTabName()
+    this.scheduleNextTitleUpdate()
+  }
+
+  constructor(adapter: SiteAdapter, settings: Settings["tab"]) {
+    this.adapter = adapter
+    this.settings = settings
+
+    // 绑定事件处理函数
+    this.boundHandleMessage = this.handleMessage.bind(this)
+    this.boundVisibilityHandler = this.onVisibilityChange.bind(this)
+    this.boundFocusHandler = this.onWindowFocus.bind(this)
+    this.boundBlurHandler = this.onWindowBlur.bind(this)
+
+    // Listen to monitor messages from Main World
+    window.addEventListener("message", this.boundHandleMessage)
+
+    // 监听页面可见性变化，用于追踪用户是否看到完成状态
+    document.addEventListener("visibilitychange", this.boundVisibilityHandler)
+    // 补充：监听 window 的 focus/blur 事件，作为 visibilitychange 的备用方案
+    // 某些情况下 document.hidden 可能始终返回 false，但 blur/focus 事件仍能正常触发
+    window.addEventListener("focus", this.boundFocusHandler)
+    window.addEventListener("blur", this.boundBlurHandler)
+  }
+
+  updateSettings(settings: Settings["tab"]) {
+    const oldInterval = this.settings.renameInterval
+    const oldNotificationSettings = {
+      showNotification: this.settings.showNotification,
+      notificationSound: this.settings.notificationSound,
+      notificationSoundPreset: this.settings.notificationSoundPreset,
+      notificationVolume: this.settings.notificationVolume,
+      notificationRepeatCount: this.settings.notificationRepeatCount,
+      notificationRepeatInterval: this.settings.notificationRepeatInterval,
+    }
+    this.settings = settings
+
+    if (
+      oldNotificationSettings.showNotification !== this.settings.showNotification ||
+      oldNotificationSettings.notificationSound !== this.settings.notificationSound ||
+      oldNotificationSettings.notificationSoundPreset !== this.settings.notificationSoundPreset ||
+      oldNotificationSettings.notificationVolume !== this.settings.notificationVolume ||
+      oldNotificationSettings.notificationRepeatCount !== this.settings.notificationRepeatCount ||
+      oldNotificationSettings.notificationRepeatInterval !==
+        this.settings.notificationRepeatInterval
+    ) {
+      this.stopNotificationPlayback()
+    }
+
+    if (this.settings.autoRename && !this.isRunning) {
+      this.start()
+    } else if (!this.settings.autoRename && this.isRunning) {
+      this.stop()
+    }
+
+    // 如果检测频率变化且正在运行，更新间隔
+    if (this.isRunning && oldInterval !== this.settings.renameInterval) {
+      this.setInterval(this.settings.renameInterval || 5)
+    }
+
+    // 立即强制更新标签页标题（设置变更应即时生效）
+    if (this.isRunning) {
+      this.updateTabName(true)
+    }
+  }
+
+  start() {
+    if (!this.settings.autoRename) return
+    if (this.isRunning) return
+
+    // 检查适配器是否支持标签页重命名
+    if (this.adapter.supportsTabRename && !this.adapter.supportsTabRename()) {
+      return
+    }
+
+    this.isRunning = true
+    this.startTitleObserver()
+
+    this.updateTabName()
+
+    // 定时更新标签页标题（使用可配置的检测频率，后台空闲时自动降频）
+    this.startTitleUpdateLoop()
+
+    // Init Monitor
+    const config = this.adapter.getNetworkMonitorConfig
+      ? this.adapter.getNetworkMonitorConfig()
+      : null
+    if (config) {
+      window.postMessage(
+        {
+          type: EVENT_MONITOR_INIT,
+          payload: {
+            urlPatterns: config.urlPatterns,
+            urlPathEndsWith: config.urlPathEndsWith,
+            silenceThreshold: config.silenceThreshold,
+            requestBodyRules: config.requestBodyRules,
+          },
+        },
+        "*",
+      )
+    }
+  }
+
+  stop() {
+    if (!this.isRunning) return
+
+    this.isRunning = false
+    this.resetGenerationConfirmationState()
+    this.stopTitleObserver()
+    this.expectedTitle = null
+    this.staleManagedTitleAfterRouteChange = null
+    this.staleConversationTitleAfterRouteChange = null
+    forgetManagedTabTitle()
+    forgetStaleManagedTabTitle()
+
+    this.clearTitleUpdateTimer()
+  }
+
+  /**
+   * 销毁管理器，移除所有监听器
+   */
+  destroy() {
+    this.stop()
+    this.stopNotificationPlayback()
+    this.resetGenerationConfirmationState()
+    this.stopTitleObserver()
+    window.removeEventListener("message", this.boundHandleMessage)
+    document.removeEventListener("visibilitychange", this.boundVisibilityHandler)
+    window.removeEventListener("focus", this.boundFocusHandler)
+    window.removeEventListener("blur", this.boundBlurHandler)
+  }
+
+  /**
+   * 更新检测频率
+   */
+  setInterval(intervalSeconds: number) {
+    if (!this.isRunning) return
+
+    this.settings.renameInterval = intervalSeconds
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  private startTitleUpdateLoop() {
+    if (this.intervalId) return
+    this.scheduleNextTitleUpdate()
+  }
+
+  private scheduleNextTitleUpdate(reset = false) {
+    if (!this.isRunning) return
+
+    if (this.intervalId) {
+      if (!reset) return
+      clearTimeout(this.intervalId)
+      this.intervalId = null
+    }
+
+    this.intervalId = setTimeout(this.handleTitleUpdateTimer, this.getTitleUpdateDelayMs())
+  }
+
+  private clearTitleUpdateTimer() {
+    if (this.intervalId) {
+      clearTimeout(this.intervalId)
+      this.intervalId = null
+    }
+  }
+
+  private getTitleUpdateDelayMs(): number {
+    const configuredIntervalMs =
+      Math.max(1, this.settings.renameInterval || DEFAULT_RENAME_INTERVAL_SECONDS) * 1000
+
+    if (this.shouldUseBackgroundIdleTitleUpdateInterval()) {
+      return Math.max(configuredIntervalMs, BACKGROUND_IDLE_TITLE_UPDATE_INTERVAL_MS)
+    }
+
+    return configuredIntervalMs
+  }
+
+  private shouldUseBackgroundIdleTitleUpdateInterval(): boolean {
+    if (!this.isUserAway()) return false
+
+    return (
+      this.aiState !== "generating" &&
+      !this.currentNetworkGenerationPending &&
+      !this.currentGenerationUsesDomCompletion &&
+      this.generationConfirmationIntervalId === null &&
+      this.domCompletionIntervalId === null
+    )
+  }
+
+  /**
+   * 切换隐私模式
+   */
+  togglePrivacyMode(): boolean {
+    this.settings.privacyMode = !this.settings.privacyMode
+    this.updateTabName(true)
+    return this.settings.privacyMode
+  }
+
+  /**
+   * 重置对话标题缓存
+   * 用于 SPA 切换对话时清除旧的对话标题
+   */
+  resetConversationTitleCache() {
+    const currentDocumentTitle = normalizeConversationTitle(document.title)
+    const previousManagedTitle =
+      normalizeConversationTitle(this.expectedTitle) ||
+      normalizeConversationTitle(getRememberedManagedTabTitle())
+    const previousConversationTitle = normalizeConversationTitle(this.lastConversationTitle)
+    const parsedPreviousConversationTitle =
+      currentDocumentTitle && currentDocumentTitle === previousManagedTitle
+        ? sanitizeConversationTitleCandidate(currentDocumentTitle, {
+            expectedManagedTitle: previousManagedTitle,
+            privacyTitle: this.settings.privacyTitle || "Google",
+            siteName: this.adapter.getName(),
+            titleFormat: this.settings.titleFormat,
+          })
+        : null
+
+    this.lastConversationTitle = null
+    this.expectedTitle = null
+    forgetManagedTabTitle()
+
+    if (currentDocumentTitle && currentDocumentTitle === previousManagedTitle) {
+      this.staleManagedTitleAfterRouteChange = currentDocumentTitle
+      this.staleConversationTitleAfterRouteChange =
+        previousConversationTitle || parsedPreviousConversationTitle
+      rememberStaleManagedTabTitle(currentDocumentTitle)
+    } else {
+      this.staleManagedTitleAfterRouteChange = null
+      this.staleConversationTitleAfterRouteChange = null
+      forgetStaleManagedTabTitle()
+    }
+  }
+
+  /**
+   * 更新标签页标题
+   * 设为 public 以支持 SPA 导航切换时外部调用
+   */
+  updateTabName(force = false) {
+    if (!this.isRunning && !force) return
+
+    // 检查适配器是否支持标签页重命名
+    if (this.adapter.supportsTabRename && !this.adapter.supportsTabRename()) {
+      return
+    }
+
+    // 隐私模式
+    if (this.settings.privacyMode) {
+      const privacyTitle = this.settings.privacyTitle || "Google"
+      this.applyManagedTitle(privacyTitle, force)
+      return
+    }
+
+    // 获取对话标题（防止读取被污染的 title）
+    const conversationTitle = this.getCleanConversationTitle()
+
+    // 检查生成状态
+    const isGenerating = this.isCurrentlyGenerating()
+
+    // DOM 检测的状态变更通知（用于没有网络监控的站点或后备检测）
+    if (
+      this.lastAiState === "generating" &&
+      !isGenerating &&
+      this.isUserAway() &&
+      this.aiState !== "completed"
+    ) {
+      this.sendCompletionNotification()
+    }
+    this.lastAiState = isGenerating ? "generating" : "idle"
+
+    // 构建标题
+    // 开启 showStatus 时：生成中显示 ⏳，生成完成显示 ✅
+    // 若开启 hideStatusWhenRead 且用户已查看过完成结果，则隐藏 ✅
+    const statusPrefix = this.computeStatusPrefix(isGenerating)
+
+    const siteName = this.adapter.getName()
+    const format = this.settings.titleFormat ?? "{status}{title}"
+
+    // 获取模型名称（如果格式中包含 {model}）
+    const modelName = format.includes("{model}") ? this.adapter.getModelName?.() || "" : ""
+
+    const finalTitle = formatManagedTabTitle(format, {
+      statusPrefix,
+      conversationTitle: conversationTitle || siteName,
+      modelName,
+      siteName,
+    })
+
+    if (finalTitle) {
+      this.applyManagedTitle(finalTitle, force)
+    }
+  }
+
+  /**
+   * 计算标题前缀中的状态图标
+   * - showStatus 关闭时返回空字符串
+   * - 生成中始终显示 ⏳
+   * - hideStatusWhenRead 关闭时：idle/completed 均显示 ✅（原有行为）
+   * - hideStatusWhenRead 开启时：✅ 仅代表"有未读的完成回复"，idle 和已查看的 completed 均不显示图标
+   */
+  private computeStatusPrefix(isGenerating: boolean): string {
+    if (this.settings.showStatus === false) return ""
+
+    if (isGenerating) return "⏳ "
+
+    // hideStatusWhenRead 模式：✅ 只在 completed 且未查看时出现
+    if (this.settings.hideStatusWhenRead) {
+      if (this.aiState === "completed" && !this.completionViewed) return "✅ "
+      return ""
+    }
+
+    // 原有行为：idle/completed 均显示 ✅
+    return "✅ "
+  }
+
+  private applyManagedTitle(title: string, force = false) {
+    this.expectedTitle = title
+    forgetStaleManagedTabTitle()
+    rememberManagedTabTitle(title)
+
+    if (!force && document.title === title) {
+      return
+    }
+
+    this.isApplyingManagedTitle = true
+    document.title = title
+    queueMicrotask(() => {
+      this.isApplyingManagedTitle = false
+    })
+  }
+
+  private startTitleObserver() {
+    if (this.titleObserver || typeof MutationObserver === "undefined") {
+      return
+    }
+
+    const observe = () => {
+      if (!document.head) return
+      this.titleObserver?.disconnect()
+      this.titleObserver?.observe(document.head, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      })
+    }
+
+    this.titleObserver = new MutationObserver(() => {
+      if (!this.isRunning || !this.settings.autoRename) return
+      if (this.isApplyingManagedTitle) return
+      if (!this.expectedTitle) return
+      if (document.title === this.expectedTitle) return
+
+      if (this.titleSyncTimer !== null) {
+        window.clearTimeout(this.titleSyncTimer)
+      }
+
+      this.titleSyncTimer = window.setTimeout(() => {
+        this.titleSyncTimer = null
+        if (!this.isRunning || !this.settings.autoRename) return
+        if (this.isApplyingManagedTitle) return
+        if (!this.expectedTitle || document.title === this.expectedTitle) return
+        this.updateTabName(true)
+      }, 0)
+    })
+
+    observe()
+  }
+
+  private stopTitleObserver() {
+    if (this.titleSyncTimer !== null) {
+      window.clearTimeout(this.titleSyncTimer)
+      this.titleSyncTimer = null
+    }
+
+    this.titleObserver?.disconnect()
+    this.titleObserver = null
+    this.isApplyingManagedTitle = false
+  }
+
+  /**
+   * 获取干净的对话标题（过滤被污染的标签页标题）
+   */
+  private getCleanConversationTitle(): string | null {
+    // 新对话页面：清除旧会话标题，避免使用之前的标题
+    if (this.adapter.isNewConversation?.()) {
+      this.lastConversationTitle = null
+      return null
+    }
+
+    // 优先读取站点 DOM/API 暴露的对话标题；只有它不可用时，才走 document.title fallback。
+    const conversationTitle = this.sanitizeAdapterTitleCandidate(
+      this.adapter.getConversationTitle?.(),
+    )
+
+    // 如果获取到有效且非污染的标题，更新缓存并返回
+    if (conversationTitle) {
+      this.clearStaleManagedTitleAfterRouteChange()
+      this.lastConversationTitle = conversationTitle
+      return conversationTitle
+    }
+
+    if (this.expectedTitle && document.title === this.expectedTitle && this.lastConversationTitle) {
+      return this.lastConversationTitle
+    }
+
+    const sessionTitle = this.sanitizeAdapterTitleCandidate(this.adapter.getSessionName?.())
+    if (sessionTitle) {
+      this.clearStaleManagedTitleAfterRouteChange()
+      this.lastConversationTitle = sessionTitle
+      return sessionTitle
+    }
+
+    // 否则返回缓存的标题（可能为 null）
+    return this.lastConversationTitle
+  }
+
+  private sanitizeAdapterTitleCandidate(rawTitle: string | null | undefined): string | null {
+    if (this.shouldIgnoreStaleManagedTitle(rawTitle)) {
+      return null
+    }
+
+    if (this.shouldIgnoreCurrentManagedDocumentTitle(rawTitle)) {
+      return null
+    }
+
+    return sanitizeConversationTitleCandidate(rawTitle, {
+      expectedManagedTitle: this.expectedTitle,
+      privacyTitle: this.settings.privacyTitle || "Google",
+      siteName: this.adapter.getName(),
+      titleFormat: this.settings.titleFormat,
+    })
+  }
+
+  private shouldIgnoreStaleManagedTitle(rawTitle: string | null | undefined): boolean {
+    if (!this.staleManagedTitleAfterRouteChange) return false
+
+    if (normalizeConversationTitle(document.title) !== this.staleManagedTitleAfterRouteChange) {
+      this.clearStaleManagedTitleAfterRouteChange()
+      return false
+    }
+
+    return this.isManagedDocumentTitleFallback(
+      rawTitle,
+      this.staleManagedTitleAfterRouteChange,
+      this.staleConversationTitleAfterRouteChange,
+    )
+  }
+
+  private shouldIgnoreCurrentManagedDocumentTitle(rawTitle: string | null | undefined): boolean {
+    if (!this.expectedTitle) return false
+    if (
+      normalizeConversationTitle(document.title) !== normalizeConversationTitle(this.expectedTitle)
+    ) {
+      return false
+    }
+
+    return this.isManagedDocumentTitleFallback(
+      rawTitle,
+      this.expectedTitle,
+      this.lastConversationTitle,
+    )
+  }
+
+  private isManagedDocumentTitleFallback(
+    rawTitle: string | null | undefined,
+    managedTitle: string | null | undefined,
+    conversationTitle: string | null | undefined,
+  ): boolean {
+    const title = normalizeConversationTitle(rawTitle)
+    const normalizedManagedTitle = normalizeConversationTitle(managedTitle)
+    if (!title || !normalizedManagedTitle) return false
+
+    if (title === normalizedManagedTitle) return true
+
+    const statusStrippedManagedTitle = normalizeConversationTitle(
+      normalizedManagedTitle.replace(/^(?:[⏳✅]\s*)+/u, ""),
+    )
+    if (statusStrippedManagedTitle && title === statusStrippedManagedTitle) return true
+
+    const parsedManagedTitle = sanitizeConversationTitleCandidate(normalizedManagedTitle, {
+      expectedManagedTitle: normalizedManagedTitle,
+      privacyTitle: this.settings.privacyTitle || "Google",
+      siteName: this.adapter.getName(),
+      titleFormat: this.settings.titleFormat,
+    })
+    if (parsedManagedTitle && title === parsedManagedTitle) return true
+
+    return Boolean(conversationTitle && title === normalizeConversationTitle(conversationTitle))
+  }
+
+  private clearStaleManagedTitleAfterRouteChange() {
+    this.staleManagedTitleAfterRouteChange = null
+    this.staleConversationTitleAfterRouteChange = null
+    forgetStaleManagedTabTitle()
+  }
+
+  /**
+   * 获取当前是否正在生成
+   */
+  private isCurrentlyGenerating(): boolean {
+    // 如果已确认完成，返回 false
+    if (this.aiState === "completed") return false
+    // 否则结合网络状态和 DOM 检测
+    return this.aiState === "generating" || (this.adapter.isGenerating?.() ?? false)
+  }
+
+  private requiresDomConfirmationForNetworkGeneration(): boolean {
+    return this.adapter.requiresDomConfirmationForNetworkGeneration?.() ?? false
+  }
+
+  private beginNetworkGeneration(payload?: MonitorEventPayload) {
+    this.stopNotificationPlayback()
+
+    if (payload?.domCompletionRequired) {
+      this.beginDomCompletionDrivenGeneration()
+      return
+    }
+
+    this.resetDomCompletionState()
+
+    if (!this.requiresDomConfirmationForNetworkGeneration()) {
+      this.confirmCurrentNetworkGeneration()
+      return
+    }
+
+    this.currentNetworkGenerationPending = true
+    this.currentNetworkGenerationConfirmed = false
+    this.scheduleNextTitleUpdate(true)
+    this.startGenerationConfirmationPolling()
+  }
+
+  private confirmCurrentNetworkGeneration() {
+    this.currentNetworkGenerationPending = false
+    this.currentNetworkGenerationConfirmed = true
+    this.adapter.setNetworkGenerationState(true)
+    this.clearGenerationConfirmationPolling()
+
+    if (this.aiState !== "generating") {
+      this.lastAiState = this.aiState
+      this.aiState = "generating"
+      // 新一轮生成开始，重置完成查看标记
+      if (this.settings.hideStatusWhenRead) {
+        this.completionViewed = false
+      }
+    }
+
+    this.updateTabName()
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  private startGenerationConfirmationPolling() {
+    this.clearGenerationConfirmationPolling()
+
+    const confirmIfGenerating = () => {
+      if (!this.currentNetworkGenerationPending) return
+
+      if (this.adapter.isGenerating?.() ?? false) {
+        this.confirmCurrentNetworkGeneration()
+      }
+    }
+
+    confirmIfGenerating()
+
+    if (!this.currentNetworkGenerationConfirmed) {
+      this.generationConfirmationIntervalId = window.setInterval(confirmIfGenerating, 200)
+    }
+  }
+
+  private beginDomCompletionDrivenGeneration() {
+    this.resetGenerationConfirmationState()
+    this.currentGenerationUsesDomCompletion = true
+    this.currentDomCompletionObservedStart = false
+    this.domCompletionTrackingStartedAt = Date.now()
+    this.completionViewed = false
+    this.startDomCompletionPolling()
+    this.updateTabName()
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  private startDomCompletionPolling() {
+    this.clearDomCompletionPolling()
+
+    const poll = () => {
+      if (!this.currentGenerationUsesDomCompletion) return
+
+      const isGenerating = this.adapter.isGenerating?.() ?? false
+      if (!this.currentDomCompletionObservedStart) {
+        if (isGenerating) {
+          this.currentDomCompletionObservedStart = true
+          if (this.aiState !== "generating") {
+            this.lastAiState = this.aiState
+            this.aiState = "generating"
+            this.completionViewed = false
+          }
+          this.updateTabName()
+          return
+        }
+
+        // 思考模式请求会先 handoff 再真正进入生成。若长时间未进入 DOM 生成态，
+        // 则视为本轮没有可追踪的生成，避免轮询残留。
+        if (Date.now() - this.domCompletionTrackingStartedAt > 30_000) {
+          this.lastAiState = this.aiState
+          this.aiState = "idle"
+          this.userSawCompletion = false
+          this.completionViewed = false
+          this.resetDomCompletionState()
+          this.updateTabName(true)
+          this.scheduleNextTitleUpdate(true)
+        }
+        return
+      }
+
+      if (!isGenerating) {
+        this.finalizeAiCompletion()
+      }
+    }
+
+    poll()
+    if (this.currentGenerationUsesDomCompletion) {
+      this.domCompletionIntervalId = window.setInterval(poll, 150)
+    }
+  }
+
+  private clearGenerationConfirmationPolling() {
+    if (this.generationConfirmationIntervalId !== null) {
+      window.clearInterval(this.generationConfirmationIntervalId)
+      this.generationConfirmationIntervalId = null
+    }
+  }
+
+  private clearDomCompletionPolling() {
+    if (this.domCompletionIntervalId !== null) {
+      window.clearInterval(this.domCompletionIntervalId)
+      this.domCompletionIntervalId = null
+    }
+  }
+
+  private resetDomCompletionState() {
+    this.clearDomCompletionPolling()
+    this.currentGenerationUsesDomCompletion = false
+    this.currentDomCompletionObservedStart = false
+    this.domCompletionTrackingStartedAt = 0
+  }
+
+  private resetGenerationConfirmationState() {
+    this.clearGenerationConfirmationPolling()
+    this.resetDomCompletionState()
+    this.currentNetworkGenerationPending = false
+    this.currentNetworkGenerationConfirmed = false
+    this.adapter.setNetworkGenerationState(false)
+  }
+
+  private handleMessage(event: MessageEvent) {
+    // 兼容性与安全性平衡：
+    // 1. 移除 event.source === window 检查（油猴脚本中 source 可能不一致）
+    // 2. 增加 origin 检查，防止跨域 iframe 干扰
+    if (event.origin !== window.location.origin) return
+
+    const { type, payload } = event.data || {}
+
+    if (type === EVENT_MONITOR_START) {
+      this.beginNetworkGeneration(payload as MonitorEventPayload | undefined)
+    } else if (type === EVENT_MONITOR_COMPLETE) {
+      this.onAiComplete()
+    }
+  }
+
+  /**
+   * 判断用户是否「离开」当前页面
+   * 综合使用多种检测方式，因为 document.hidden 在某些情况下可能始终返回 false
+   */
+  private isUserAway(): boolean {
+    // 方式1: document.hidden - 标准的 Page Visibility API
+    const hidden = document.hidden
+    // 方式2: document.hasFocus() - 检查文档是否获得焦点
+    const hasFocus = document.hasFocus()
+    // 方式3: document.visibilityState - 更详细的可见性状态
+    const notVisible = document.visibilityState !== "visible"
+
+    // 如果任一条件表明用户不在当前页面，则认为用户已离开
+    return hidden || !hasFocus || notVisible
+  }
+
+  /**
+   * 页面可见性变化处理
+   * 用于追踪用户是否在前台看到过生成完成
+   */
+  private onVisibilityChange() {
+    const isAway = this.isUserAway()
+
+    if (!isAway) {
+      this.stopNotificationPlayback({ stopCurrentAudio: false })
+    }
+
+    // 用户切换回页面时，检查 DOM 状态
+    // 如果正在生成但 DOM 显示已完成，说明用户看到了完成状态
+    if (this.aiState === "generating" && !isAway) {
+      if (this.adapter.isGenerating && !this.adapter.isGenerating()) {
+        this.userSawCompletion = true
+      }
+    }
+
+    // 用户切回已完成的标签页，标记为已查看（隐藏 ✅）
+    if (this.aiState === "completed" && !isAway) {
+      if (!this.completionViewed) {
+        this.completionViewed = true
+        this.updateTabName(true)
+      }
+    }
+
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  /**
+   * 窗口获得焦点事件处理
+   */
+  private onWindowFocus() {
+    this.stopNotificationPlayback({ stopCurrentAudio: false })
+
+    // 用户回到页面时，检查是否应该标记 userSawCompletion
+    if (this.aiState === "generating") {
+      if (this.adapter.isGenerating && !this.adapter.isGenerating()) {
+        this.userSawCompletion = true
+      }
+    }
+
+    // 用户回到已完成的页面，标记为已查看
+    if (this.aiState === "completed") {
+      if (!this.completionViewed) {
+        this.completionViewed = true
+      }
+    }
+
+    if (this.isRunning) {
+      this.updateTabName(true)
+      this.scheduleNextTitleUpdate(true)
+    }
+  }
+
+  /**
+   * 窗口失去焦点事件处理
+   */
+  private onWindowBlur() {
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  /**
+   * AI 任务完成处理（由 NetworkMonitor 触发）
+   */
+  private onAiComplete() {
+    if (this.currentGenerationUsesDomCompletion) {
+      // ChatGPT 思考模式下，/backend-api/f/conversation 的 complete 仅代表 handoff 结束，
+      // 真正的完成要等 stop 按钮出现并最终消失。
+      return
+    }
+
+    const requiresDomConfirmation = this.requiresDomConfirmationForNetworkGeneration()
+    const generationConfirmed = this.currentNetworkGenerationConfirmed
+
+    if (requiresDomConfirmation && !generationConfirmed) {
+      this.resetGenerationConfirmationState()
+      this.lastAiState = this.aiState
+      this.aiState = "idle"
+      this.userSawCompletion = false
+      this.completionViewed = false
+      this.updateTabName(true)
+      this.scheduleNextTitleUpdate(true)
+      return
+    }
+
+    this.finalizeAiCompletion()
+  }
+
+  private finalizeAiCompletion() {
+    const wasGenerating = this.aiState === "generating"
+    this.lastAiState = this.aiState
+    this.aiState = "completed"
+
+    // 检查是否应当发送通知
+    // 1. 必须是从生成状态完成
+    // 2. 用户没有在前台看到过完成状态
+    // 3. 要么在后台，要么开启了「前台时也通知」
+    const notifyWhenFocused = this.settings.notifyWhenFocused
+    const isAway = this.isUserAway()
+    const shouldNotify = wasGenerating && !this.userSawCompletion && (isAway || notifyWhenFocused)
+
+    if (shouldNotify) {
+      this.sendCompletionNotification()
+    }
+
+    // 若用户在前台，标记为已查看（用于 hideStatusWhenRead 功能）
+    if (!isAway) {
+      this.completionViewed = true
+    }
+
+    // 重置状态
+    this.userSawCompletion = false
+    this.resetGenerationConfirmationState()
+
+    // 强制更新标签页标题（若 completionViewed 已标记，此次更新会隐藏 ✅）
+    this.updateTabName(true)
+    this.scheduleNextTitleUpdate(true)
+  }
+
+  /**
+   * 发送完成通知
+   */
+  private sendCompletionNotification() {
+    this.stopNotificationPlayback()
+
+    // 发送桌面通知（使用平台抽象层，支持扩展和油猴脚本）
+    if (this.settings.showNotification) {
+      try {
+        const siteName = this.adapter.getName()
+        // 使用国际化翻译，支持10种语言
+        const title = t("notificationTitle").replace("{site}", siteName)
+        const message =
+          this.lastConversationTitle ||
+          sanitizeConversationTitleCandidate(this.adapter.getConversationTitle?.(), {
+            expectedManagedTitle: this.expectedTitle,
+            privacyTitle: this.settings.privacyTitle || "Google",
+            siteName: this.adapter.getName(),
+            titleFormat: this.settings.titleFormat,
+          }) ||
+          t("notificationBody")
+        platform.notify({ title, message })
+      } catch (e) {
+        console.error("[TabManager] 通知发送失败:", e)
+      }
+    }
+
+    // 播放通知声音（仅在发送桌面通知时随通知播放）
+    if (this.settings.showNotification && this.settings.notificationSound) {
+      this.playNotificationSound()
+    }
+
+    // 自动窗口置顶（使用平台抽象层）
+    if (this.settings.autoFocus) {
+      platform.focusWindow()
+    }
+  }
+
+  /**
+   * 播放通知声音
+   */
+  private playNotificationSound() {
+    const presetId = this.settings.notificationSoundPreset || NOTIFICATION_SOUND_PRESETS[0].id
+    const preset =
+      NOTIFICATION_SOUND_PRESETS.find((item) => item.id === presetId) ||
+      NOTIFICATION_SOUND_PRESETS[0]
+    const sourceUrl = platform.getNotificationSoundUrl(preset.id)
+
+    if (!sourceUrl) {
+      console.warn("[TabManager] Notification sound URL not found for preset:", preset.id)
+      return
+    }
+
+    const repeatCount = this.normalizeNotificationRepeatCount(this.settings.notificationRepeatCount)
+    const repeatIntervalMs =
+      this.normalizeNotificationRepeatInterval(this.settings.notificationRepeatInterval) * 1000
+
+    this.startNotificationPlayback(sourceUrl, repeatCount, repeatIntervalMs)
+  }
+
+  /**
+   * 启动可中断的通知声音播放
+   */
+  private startNotificationPlayback(url: string, repeatCount: number, repeatIntervalMs: number) {
+    this.stopNotificationPlayback()
+
+    const playbackId = ++this.notificationPlaybackId
+
+    const playOnce = (remainingCount: number) => {
+      if (playbackId !== this.notificationPlaybackId) return
+
+      try {
+        if (!this.notificationAudio) {
+          this.notificationAudio = new Audio()
+        }
+
+        const volume = this.settings.notificationVolume ?? 0.5
+        this.notificationAudio.volume = Math.max(0.1, Math.min(1.0, volume))
+        this.notificationAudio.src = url
+        this.notificationAudio.currentTime = 0
+        this.notificationAudio.onended = () => {
+          if (playbackId !== this.notificationPlaybackId) return
+
+          if (remainingCount <= 1) {
+            this.clearNotificationPlaybackHandlers()
+            this.notificationRepeatTimer = null
+            return
+          }
+
+          if (!this.isUserAway()) {
+            this.stopNotificationPlayback()
+            return
+          }
+
+          this.notificationRepeatTimer = window.setTimeout(() => {
+            this.notificationRepeatTimer = null
+            playOnce(remainingCount - 1)
+          }, repeatIntervalMs)
+        }
+        this.notificationAudio.onerror = () => {
+          if (playbackId === this.notificationPlaybackId) {
+            console.error("[TabManager] Notification audio element error:", {
+              url,
+              mediaError: this.notificationAudio?.error,
+            })
+            this.stopNotificationPlayback()
+          }
+        }
+        this.notificationAudio.play().catch((error) => {
+          if (playbackId === this.notificationPlaybackId) {
+            console.error("[TabManager] Notification audio play rejected:", { url, error })
+            this.stopNotificationPlayback()
+          }
+        })
+      } catch (e) {
+        console.error("[TabManager] 音频初始化失败:", e)
+      }
+    }
+
+    playOnce(repeatCount)
+  }
+
+  /**
+   * 停止当前通知声音播放与后续重复
+   */
+  private stopNotificationPlayback(options?: { stopCurrentAudio?: boolean }) {
+    const stopCurrentAudio = options?.stopCurrentAudio ?? true
+    this.notificationPlaybackId += 1
+
+    if (this.notificationRepeatTimer !== null) {
+      window.clearTimeout(this.notificationRepeatTimer)
+      this.notificationRepeatTimer = null
+    }
+
+    try {
+      if (stopCurrentAudio && this.notificationAudio) {
+        this.clearNotificationPlaybackHandlers()
+        this.notificationAudio.pause()
+        this.notificationAudio.currentTime = 0
+      }
+    } catch (e) {
+      console.error("[TabManager] 音频停止失败:", e)
+    }
+  }
+
+  private clearNotificationPlaybackHandlers() {
+    if (!this.notificationAudio) return
+
+    this.notificationAudio.onended = null
+    this.notificationAudio.onerror = null
+  }
+
+  private normalizeNotificationRepeatCount(value?: number) {
+    if (!Number.isFinite(value)) return 1
+    return Math.max(1, Math.min(10, Math.round(value as number)))
+  }
+
+  private normalizeNotificationRepeatInterval(value?: number) {
+    if (!Number.isFinite(value)) return 3
+    return Math.max(1, Math.min(60, value as number))
+  }
+
+  /**
+   * 获取当前状态
+   */
+  isActive(): boolean {
+    return this.isRunning
+  }
+}
